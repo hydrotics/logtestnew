@@ -161,7 +161,7 @@ class LogBot(discord.Client):
 
 
 forum_pacer = ForumCreatePacer(FORUM_CHANNEL_ID)
-bot = LogBot(forum_pacer.trace_config)
+bot = LogBot()
 tree = bot.tree
 
 database = Database(DATABASE_PATH)
