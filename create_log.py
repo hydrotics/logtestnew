@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -253,6 +254,9 @@ class Database:
 
     def __init__(self, path: str) -> None:
         self.path = path
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -537,6 +541,8 @@ class LogManager:
         self._job_task: Optional[asyncio.Task] = None
         self._auto_task: Optional[asyncio.Task] = None
         self._auto_queue: dict[int, discord.Member] = {}
+        self._auto_reconcile_task: Optional[asyncio.Task] = None
+        self._last_auto_reconcile = 0.0
         self._abort = False
         self._consecutive_failures = 0
         self.status_mention = "`/status`"
@@ -619,6 +625,20 @@ class LogManager:
             if user_id is not None:
                 by_user[user_id] = thread
 
+        # ForumChannel.threads is a cache, not an authoritative inventory.
+        # Fetch the guild's active threads so logs that were created while the
+        # bot was offline are still discovered after a restart/reconnect.
+        try:
+            active_threads = await forum_channel.guild.active_threads()
+            for thread in active_threads:
+                if thread.parent_id == forum_channel.id:
+                    index(thread)
+        except discord.HTTPException as exc:
+            complete = False
+            logger.warning("Could not fully scan active forum posts (%s).", exc)
+
+        # Keep cached forum threads as an additional source in case the active
+        # endpoint is temporarily incomplete.
         for thread in forum_channel.threads:
             index(thread)
 
@@ -872,9 +892,14 @@ class LogManager:
         handler: Callable[[Any], Awaitable[bool]],
         label: str,
     ) -> None:
-        """Process items with `self.concurrency` workers sharing one iterator."""
-        async with self.lock:
-            try:
+        """Process items with one or more workers sharing one iterator.
+
+        The job remains marked running until the shared lock has actually been
+        released. This prevents the UI from saying a job is finished while a
+        second job is still temporarily blocked behind the lock.
+        """
+        try:
+            async with self.lock:
                 iterator = iter(items)
 
                 async def worker() -> None:
@@ -887,8 +912,10 @@ class LogManager:
                         await self._process_item(handler, item, label)
 
                 await asyncio.gather(*(worker() for _ in range(self.concurrency)))
-            finally:
-                self._finish_job()
+        finally:
+            # This runs after `async with self.lock` exits, so a new job can
+            # start immediately after we mark the old one finished.
+            self._finish_job()
 
     def _finish_job(self) -> None:
         self.job.running = False
@@ -908,14 +935,26 @@ class LogManager:
     # Automatic logging
     # ------------------------------------------------------------------
 
-    async def ensure_member_has_log(self, member: discord.Member) -> bool:
-        """Queue an automatic log for `member`. Returns True if queued.
+    def _queue_auto_members(self, members: Iterable[discord.Member]) -> int:
+        """Add missing members to the persistent auto-log work queue."""
+        queued = 0
+        for member in members:
+            if member.bot or member.id in self.known_logs:
+                continue
+            if member.id not in self._auto_queue:
+                self._auto_queue[member.id] = member
+                queued += 1
 
-        BUG FIX: the old version only drained its queue when a *bulk* job
-        finished, so two members joining at the same time left the second one
-        queued forever. A single worker now owns the queue.
-        """
-        if member.bot:
+        if queued and (self._auto_task is None or self._auto_task.done()):
+            self._auto_task = asyncio.create_task(
+                self._auto_worker(),
+                name="auto-log-worker",
+            )
+        return queued
+
+    async def ensure_member_has_log(self, member: discord.Member) -> bool:
+        """Queue an automatic log for `member`. Returns True if queued."""
+        if not self.auto_log_enabled or member.bot:
             return False
 
         forum_channel = await self.get_forum_channel()
@@ -929,13 +968,54 @@ class LogManager:
         if member.id in self.known_logs:
             return False
 
-        self._auto_queue[member.id] = member
-        if self._auto_task is None or self._auto_task.done():
-            self._auto_task = asyncio.create_task(
-                self._auto_worker(),
-                name="auto-log-worker",
+        return bool(self._queue_auto_members([member]))
+
+    def schedule_auto_reconcile(self, force: bool = False) -> None:
+        """Schedule a startup/reconnect reconciliation when Auto Log is enabled.
+
+        Reconciliation is intentionally cooldown-limited so transient Discord
+        gateway reconnects do not cause repeated full scans of archived posts.
+        """
+        if not self.auto_log_enabled:
+            return
+        if self._auto_reconcile_task is not None and not self._auto_reconcile_task.done():
+            return
+
+        now = time.monotonic()
+        if not force and now - self._last_auto_reconcile < 60.0:
+            return
+
+        self._last_auto_reconcile = now
+        self._auto_reconcile_task = asyncio.create_task(
+            self.reconcile_auto_logs(),
+            name="auto-log-reconcile",
+        )
+
+    async def reconcile_auto_logs(self) -> None:
+        """Repair persisted log state and queue every current member missing a log."""
+        if not self.auto_log_enabled:
+            return
+
+        try:
+            forum_channel = await self.get_forum_channel()
+            guild = self.bot.get_guild(forum_channel.guild.id) or forum_channel.guild
+            members = await self.fetch_role_members(guild)
+
+            pending, already_done = await self.get_pending_members(
+                members, forum_channel
             )
-        return True
+            queued = self._queue_auto_members(pending)
+
+            logger.info(
+                "Auto-log reconciliation complete: %d members already have logs, "
+                "%d missing logs queued.",
+                already_done,
+                queued,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Auto-log startup/reconnect reconciliation failed")
 
     async def _auto_worker(self) -> None:
         # Waiting on the lock also means waiting for any bulk job to finish.
@@ -943,6 +1023,10 @@ class LogManager:
             forum_channel: Optional[discord.ForumChannel] = None
 
             while self._auto_queue:
+                if not self.auto_log_enabled:
+                    self._auto_queue.clear()
+                    return
+
                 member_id = next(iter(self._auto_queue))
                 member = self._auto_queue.pop(member_id)
 
@@ -960,6 +1044,8 @@ class LogManager:
     def set_auto_log(self, enabled: bool) -> None:
         self.database.set_auto_log(enabled)
         self.auto_log_enabled = enabled
+        if not enabled:
+            self._auto_queue.clear()
 
     def handle_thread_delete(self, thread_id: int) -> None:
         for user_id, stored_thread_id in list(self.known_logs.items()):
@@ -981,15 +1067,20 @@ async def monitor_job_message(
     interaction: discord.Interaction,
     operation_text: str,
 ) -> None:
-    """Switch the invoking message to a live status when ETA exceeds 15s."""
+    """Show live progress and a stable final result for this specific job."""
+    # Capture the job object. A new job can replace manager.job immediately after
+    # the old one finishes, and this monitor must never report the new job's
+    # counters as the previous command's result.
+    job = manager.job
+
     live = False
     last_edit = 0.0
     started = time.monotonic()
 
-    while manager.job.running:
+    while job.running:
         await asyncio.sleep(0.5)
 
-        eta = manager.job.eta_seconds
+        eta = job.eta_seconds
         if not live and eta is not None and eta > STATUS_ETA_THRESHOLD:
             live = True
 
@@ -1004,28 +1095,28 @@ async def monitor_job_message(
                         f"{operation_text}. View the "
                         f"{manager.status_mention} below:"
                     ),
-                    embed=build_status_embed(manager.job),
+                    embed=build_status_embed(job),
                     view=None,
                 )
             except discord.HTTPException:
                 logger.debug("Could not update live progress message", exc_info=True)
 
-    job = manager.job
+    elapsed = format_duration(job.elapsed_seconds)
 
-    result = f"Created `{job.created}/{job.total}` successfully."
-    if job.failed:
-        result += f" `{job.failed}` failed."
-    if job.aborted:
-        result += (
-            " Stopped early after repeated failures"
-            f" (last error: {job.last_error})."
-        )
+    if job.failed == 0 and not job.aborted:
+        result = f"Successfully created `{job.created}` logs in • `{elapsed}`."
+    else:
+        result = f"Created `{job.created}` logs in • `{elapsed}`."
+        if job.failed:
+            result += f" `{job.failed}` failed."
+        if job.aborted:
+            result += " Stopped early after repeated failures."
 
     try:
         await interaction.edit_original_response(content=result, embed=None, view=None)
     except discord.HTTPException:
-        # BUG FIX: long jobs outlive the interaction token, so the final
-        # result silently vanished. Fall back to a normal channel message.
+        # Long jobs can outlive the interaction token. Fall back to a normal
+        # channel message using the already-captured completed job.
         logger.debug("Could not write final job result", exc_info=True)
         channel = interaction.channel
         if channel is not None and hasattr(channel, "send"):
