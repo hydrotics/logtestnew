@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 import threading
@@ -17,16 +18,29 @@ from typing import (
     Optional,
 )
 
+import aiohttp
+
+
 import discord
 
 logger = logging.getLogger("discord-log-bot.create_log")
 
-# Discord's HTTP limiter is the single source of truth for API pacing.
-# Keep application concurrency high enough to hide network latency, while
-# letting discord.py decide when a request may actually be sent.
-MAX_CONCURRENCY = 10
+# Forum-thread creation is a single hot route. Discord documents that some
+# per-guild/shared buckets can still return 429s even when the route headers
+# appear to have quota, so this bot deliberately serializes forum-create calls
+# and learns its pacing from Discord's actual response headers.
+MAX_CONCURRENCY = 1
 MAX_CONSECUTIVE_FAILURES = 10
 THREAD_NAME_LIMIT = 100
+
+# The first request has no response headers yet. Use a conservative first-to-
+# second gap, then adapt from Discord's X-RateLimit-* headers. This is not a
+# claimed Discord limit; it is only a cold-start safety interval.
+FORUM_INITIAL_INTERVAL = 1.25
+FORUM_SAFETY_FACTOR = 1.20
+FORUM_SAFETY_MARGIN = 0.15
+FORUM_RETRY_MARGIN = 0.50
+MAX_FORUM_429_RETRIES = 5
 
 PROGRESS_BAR_LENGTH = 24
 STATUS_ETA_THRESHOLD = 15.0
@@ -36,6 +50,195 @@ INTERACTION_TOKEN_SECONDS = 14 * 60   # interaction tokens die after 15 minutes
 
 _SENTINEL = object()
 
+
+
+# ----------------------------------------------------------------------------
+# Forum-create pacing
+# ----------------------------------------------------------------------------
+class ForumCreatePacer:
+    """Single-flight, header-driven scheduler for forum thread creation.
+
+    Discord explicitly recommends consuming the returned rate-limit headers
+    rather than hard-coding a route limit. A single request is allowed in
+    flight for this route; after each response we derive a conservative launch
+    interval from X-RateLimit-Limit and X-RateLimit-Reset-After.
+
+    The scheduler is intentionally separate from discord.py's internal
+    ratelimit bucket. discord.py remains responsible for its bucket/global
+    handling; this class prevents the application itself from creating a burst
+    of concurrent requests against Discord's forum-create endpoint.
+    """
+
+    def __init__(self, forum_channel_id: int) -> None:
+        self.forum_channel_id = int(forum_channel_id)
+        # Create the lock lazily inside the running event loop. This keeps the
+        # bot compatible with Python versions where asyncio primitives could
+        # otherwise bind to the loop that happened to be current at import.
+        self._lock: Optional[asyncio.Lock] = None
+        self._next_start = time.monotonic() + FORUM_INITIAL_INTERVAL
+        self._blocked_until = self._next_start
+        self._interval = FORUM_INITIAL_INTERVAL
+        self.limit: Optional[int] = None
+        self.remaining: Optional[int] = None
+        self.reset_after: Optional[float] = None
+        self.bucket: Optional[str] = None
+
+        self.trace_config = aiohttp.TraceConfig()
+        self.trace_config.on_request_end.append(self._on_request_end)
+
+    def _is_target_request(self, params: Any) -> bool:
+        try:
+            if params.method.upper() != "POST":
+                return False
+            return params.url.path.endswith(
+                f"/channels/{self.forum_channel_id}/threads"
+            )
+        except Exception:
+            return False
+
+    async def _on_request_end(self, session: Any, ctx: Any, params: Any) -> None:
+        if not self._is_target_request(params):
+            return
+
+        try:
+            headers = params.response.headers
+            self.bucket = headers.get("X-Ratelimit-Bucket", self.bucket)
+
+            limit = self._float_header(headers, "X-Ratelimit-Limit")
+            remaining = self._float_header(headers, "X-Ratelimit-Remaining")
+            reset_after = self._float_header(headers, "X-Ratelimit-Reset-After")
+
+            if limit is not None and limit > 0:
+                self.limit = max(1, int(limit))
+            if remaining is not None:
+                self.remaining = max(0, int(remaining))
+            if reset_after is not None and reset_after >= 0:
+                self.reset_after = reset_after
+
+            # Discord says these headers are the source of truth for the
+            # current bucket. Spread requests across the observed window,
+            # then add margin so clock/transport skew does not create a burst.
+            if self.reset_after is not None:
+                if self.remaining is not None and self.remaining > 0:
+                    # Spread the remaining quota across the remaining window.
+                    derived = (
+                        (self.reset_after / self.remaining) * FORUM_SAFETY_FACTOR
+                        + FORUM_SAFETY_MARGIN
+                    )
+                    self._interval = max(0.10, derived)
+                elif self.limit:
+                    # With no remaining tokens, the bucket is explicitly
+                    # exhausted; _blocked_until below waits for the reset.
+                    self._interval = max(
+                        self._interval,
+                        (self.reset_after / self.limit) * FORUM_SAFETY_FACTOR
+                        + FORUM_SAFETY_MARGIN,
+                    )
+
+            now = time.monotonic()
+            if params.response.status == 429:
+                retry_after = self._float_header(headers, "Retry-After")
+                if retry_after is None:
+                    retry_after = self.reset_after or FORUM_INITIAL_INTERVAL
+                self._blocked_until = max(
+                    self._blocked_until,
+                    now + retry_after + FORUM_RETRY_MARGIN,
+                )
+                self._interval = max(
+                    self._interval,
+                    retry_after + FORUM_RETRY_MARGIN,
+                )
+            elif self.remaining == 0 and self.reset_after is not None:
+                self._blocked_until = max(
+                    self._blocked_until,
+                    now + self.reset_after + FORUM_SAFETY_MARGIN,
+                )
+        except Exception:
+            logger.debug("Could not ingest forum rate-limit headers", exc_info=True)
+
+    @staticmethod
+    def _float_header(headers: Any, name: str) -> Optional[float]:
+        try:
+            return float(headers[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    async def _wait_for_slot(self) -> None:
+        while True:
+            delay = max(
+                0.0,
+                self._next_start - time.monotonic(),
+                self._blocked_until - time.monotonic(),
+            )
+            if delay <= 0:
+                return
+            await asyncio.sleep(delay)
+
+    @staticmethod
+    def _retry_after(exc: discord.HTTPException) -> float:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            try:
+                return max(0.0, float(headers.get("Retry-After", 0.0)))
+            except (TypeError, ValueError):
+                pass
+
+        text = getattr(exc, "text", "")
+        if isinstance(text, str):
+            try:
+                payload = json.loads(text)
+                return max(0.0, float(payload.get("retry_after", 0.0)))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+
+        return FORUM_INITIAL_INTERVAL
+
+    async def run(self, call: Callable[[], Awaitable[Any]]) -> Any:
+        """Run exactly one forum-create request at a time.
+
+        discord.py normally consumes 429 responses itself. This retry exists as
+        a final safety net for documented 429 responses that escape the HTTP
+        client's normal handling.
+        """
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+
+        async with self._lock:
+            for attempt in range(MAX_FORUM_429_RETRIES + 1):
+                await self._wait_for_slot()
+                started = time.monotonic()
+                try:
+                    result = await call()
+                    self._next_start = max(
+                        self._next_start,
+                        started + self._interval,
+                        time.monotonic() + self._interval,
+                    )
+                    return result
+                except discord.HTTPException as exc:
+                    if exc.status != 429 or attempt >= MAX_FORUM_429_RETRIES:
+                        raise
+
+                    retry_after = self._retry_after(exc)
+                    self.remaining = 0
+                    self._blocked_until = max(
+                        self._blocked_until,
+                        time.monotonic() + retry_after + FORUM_RETRY_MARGIN,
+                    )
+                    self._next_start = max(
+                        self._next_start,
+                        self._blocked_until,
+                    )
+                    logger.warning(
+                        "Forum-create request received HTTP 429; backing off %.2fs "
+                        "before retry %d/%d.",
+                        retry_after,
+                        attempt + 1,
+                        MAX_FORUM_429_RETRIES,
+                    )
+
+            raise RuntimeError("Forum-create retry loop exhausted")
 
 
 # ----------------------------------------------------------------------------
@@ -313,13 +516,18 @@ class LogManager:
         database: Database,
         role_id: int,
         forum_channel_id: int,
-        concurrency: int = 10,
+        forum_pacer: ForumCreatePacer,
+        concurrency: int = 1,
     ) -> None:
         self.bot = bot
         self.database = database
         self.role_id = role_id
         self.forum_channel_id = forum_channel_id
-        self.concurrency = max(1, min(MAX_CONCURRENCY, int(concurrency)))
+        # Keep the knob for backwards-compatible environment files, but clamp
+        # it to one for the forum-create route. Concurrent creates are the
+        # exact burst pattern this bot must avoid.
+        self.concurrency = 1
+        self.forum_pacer = forum_pacer
 
         self.known_logs: dict[int, int] = database.load_member_logs()
         self.auto_log_enabled = database.get_auto_log()
@@ -334,9 +542,9 @@ class LogManager:
         self.status_mention = "`/status`"
 
         logger.info(
-            "LogManager ready: concurrency=%d; Discord's built-in HTTP rate limiter "
-            "controls outbound request pacing.",
-            self.concurrency,
+            "LogManager ready: forum-create single-flight queue enabled; "
+            "cold-start interval=%.2fs; adaptive header pacing active.",
+            FORUM_INITIAL_INTERVAL,
         )
 
     # ------------------------------------------------------------------
@@ -505,18 +713,19 @@ class LogManager:
         title = member.name[: THREAD_NAME_LIMIT - len(suffix)] + suffix
         content = self._format_member_content(member)
 
-        # discord.py owns the HTTP bucket for this route and uses Discord's
-        # X-RateLimit-* headers to pre-emptively wait before sending. Avoid a
-        # second, user-space limiter here because it cannot see shared buckets
-        # or the global limiter and can disagree with discord.py's state.
-        result = await forum_channel.create_thread(
-            name=title,
-            content=content,
-            # The mention still renders as a clickable name, but nobody
-            # gets pinged / pulled into thousands of threads.
-            allowed_mentions=discord.AllowedMentions.none(),
-            reason=f"Member log for Discord user {member.id}",
-        )
+        async def create() -> Any:
+            return await forum_channel.create_thread(
+                name=title,
+                content=content,
+                # The mention still renders as a clickable name, but nobody
+                # gets pinged / pulled into thousands of threads.
+                allowed_mentions=discord.AllowedMentions.none(),
+                reason=f"Member log for Discord user {member.id}",
+            )
+
+        # One request at a time + adaptive pacing prevents the application
+        # from creating bursts before Discord's shared/guild bucket is known.
+        result = await self.forum_pacer.run(create)
 
         thread = getattr(result, "thread", result)
         if not isinstance(thread, discord.Thread):
@@ -553,11 +762,13 @@ class LogManager:
             "This post is for load testing and is not a real member log."
         )
 
-        await forum_channel.create_thread(
-            name=title,
-            content=content,
-            allowed_mentions=discord.AllowedMentions.none(),
-            reason="Forum load test created by /test",
+        await self.forum_pacer.run(
+            lambda: forum_channel.create_thread(
+                name=title,
+                content=content,
+                allowed_mentions=discord.AllowedMentions.none(),
+                reason="Forum load test created by /test",
+            )
         )
 
     # ------------------------------------------------------------------
@@ -629,8 +840,9 @@ class LogManager:
             logger.error("%s not found: %s", label, exc)
         except discord.HTTPException as exc:
             if exc.status == 429:
-                # discord.py normally handles route/global 429s internally.
-                # Count only a 429 that actually escapes that handling.
+                # A 429 here means both discord.py and the forum safety queue
+                # exhausted their documented recovery paths. Keep this visible
+                # instead of pretending the request was never rate limited.
                 self.job.rate_limit_hits += 1
             error = f"Discord HTTP {exc.status}: {str(exc.text)[:200]}"
             logger.error("%s HTTP failure (%s): %s", label, exc.status, exc)
