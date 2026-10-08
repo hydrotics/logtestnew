@@ -23,7 +23,7 @@ from test import build_test_command
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/var/data/bot_data.sqlite3")
 
 try:
     ROLE_ID = int(os.getenv("DISCORD_ROLE_ID", "0"))
@@ -161,9 +161,10 @@ class LogBot(discord.Client):
 
 
 forum_pacer = ForumCreatePacer(FORUM_CHANNEL_ID)
-bot = LogBot()
+bot = LogBot(forum_pacer.trace_config)
 tree = bot.tree
 
+logger.info("Using SQLite database at %s", os.path.abspath(DATABASE_PATH))
 database = Database(DATABASE_PATH)
 log_manager = LogManager(
     bot=bot,
@@ -257,7 +258,7 @@ async def run_confirmed_create_log(
     pending_members: list[discord.Member],
 ) -> None:
     try:
-        if log_manager.job.running or log_manager.lock.locked():
+        if log_manager.job.running:
             await interaction.edit_original_response(
                 content="Another logging job is already running.",
                 embed=None,
@@ -304,7 +305,7 @@ async def create_log(interaction: discord.Interaction) -> None:
             )
             return
 
-        if log_manager.job.running or log_manager.lock.locked():
+        if log_manager.job.running:
             await interaction.edit_original_response(
                 content="Another logging job is already running.",
             )
@@ -413,6 +414,10 @@ async def auto_log(
         content=f"Automatic logging is now **{'enabled' if enabled else 'disabled'}**.",
         ephemeral=True,
     )
+    if enabled:
+        # Enabling Auto Log also repairs/queues existing members; it is not
+        # limited to members who join after the setting is turned on.
+        log_manager.schedule_auto_reconcile(force=True)
 
 
 @bot.event
@@ -464,6 +469,10 @@ async def on_ready() -> None:
         logger.error("Commands are not ready: %s", bot.command_setup_error)
     elif bot.commands_ready.is_set():
         logger.info("Command registration is stable; no command resync on reconnect.")
+        # Gateway reconnects do not guarantee that every member event that
+        # occurred while offline was replayed. Reconcile persisted/Discord
+        # state whenever Auto Log is enabled.
+        log_manager.schedule_auto_reconcile()
 
 
 @bot.event
