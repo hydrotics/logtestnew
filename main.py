@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from create_log import (
     Database,
+    ForumCreatePacer,
     LogManager,
     build_status_embed,
     monitor_job_message,
@@ -27,10 +28,9 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")
 try:
     ROLE_ID = int(os.getenv("DISCORD_ROLE_ID", "0"))
     FORUM_CHANNEL_ID = int(os.getenv("DISCORD_FORUM_CHANNEL_ID", "0"))
-    # Number of application-level workers. discord.py's HTTP client owns the
-    # actual Discord rate-limit buckets, so workers may stay concurrent without
-    # bypassing Discord's limiter.
-    CREATE_CONCURRENCY = int(os.getenv("CREATE_CONCURRENCY", "10"))
+    # Kept for compatibility with existing deployments. The forum-create route
+    # is deliberately single-flight in LogManager to prevent request bursts.
+    CREATE_CONCURRENCY = int(os.getenv("CREATE_CONCURRENCY", "1"))
 except ValueError as exc:
     raise RuntimeError(
         "DISCORD_ROLE_ID, DISCORD_FORUM_CHANNEL_ID and CREATE_CONCURRENCY "
@@ -160,7 +160,8 @@ class LogBot(discord.Client):
         database.close()
 
 
-bot = LogBot()
+forum_pacer = ForumCreatePacer(FORUM_CHANNEL_ID)
+bot = LogBot(forum_pacer.trace_config)
 tree = bot.tree
 
 database = Database(DATABASE_PATH)
@@ -169,6 +170,7 @@ log_manager = LogManager(
     database=database,
     role_id=ROLE_ID,
     forum_channel_id=FORUM_CHANNEL_ID,
+    forum_pacer=forum_pacer,
     concurrency=CREATE_CONCURRENCY,
 )
 
