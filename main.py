@@ -4,6 +4,8 @@ import asyncio
 import logging
 import math
 import os
+import sqlite3
+import tempfile
 from typing import Any
 
 import discord
@@ -23,7 +25,12 @@ from test import build_test_command
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/var/data/bot_data.sqlite3")
+# Prefer a database beside the app when DATABASE_PATH is not configured.
+# On Render, /var/data is only writable when a persistent disk is mounted there.
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.sqlite3"),
+)
 
 try:
     ROLE_ID = int(os.getenv("DISCORD_ROLE_ID", "0"))
@@ -164,8 +171,42 @@ forum_pacer = ForumCreatePacer(FORUM_CHANNEL_ID)
 bot = LogBot()
 tree = bot.tree
 
+def _open_database(configured_path: str) -> tuple[Database, str]:
+    """Open SQLite at the configured path, with a writable fallback.
+
+    A Render service without a disk mounted at /var/data cannot create files
+    there. Fall back to the OS temporary directory so the bot can still start.
+    The fallback is ephemeral; configure DATABASE_PATH to a mounted disk for
+    persistence across restarts/deploys.
+    """
+    fallback_path = os.path.join(tempfile.gettempdir(), "bot_data.sqlite3")
+
+    def should_fallback(exc: BaseException) -> bool:
+        message = str(exc).lower()
+        return isinstance(exc, (PermissionError, OSError)) or any(
+            marker in message
+            for marker in ("unable to open database file", "readonly database", "read-only database", "permission denied")
+        )
+
+    try:
+        return Database(configured_path), configured_path
+    except (PermissionError, OSError, sqlite3.OperationalError) as exc:
+        if not should_fallback(exc):
+            raise
+        if os.path.abspath(configured_path) == os.path.abspath(fallback_path):
+            raise
+        logger.warning(
+            "Cannot use DATABASE_PATH=%s (%s). Falling back to temporary SQLite path %s. "
+            "Set DATABASE_PATH to a writable mounted disk to keep data across restarts.",
+            configured_path,
+            exc,
+            fallback_path,
+        )
+        return Database(fallback_path), fallback_path
+
+
+database, DATABASE_PATH = _open_database(DATABASE_PATH)
 logger.info("Using SQLite database at %s", os.path.abspath(DATABASE_PATH))
-database = Database(DATABASE_PATH)
 log_manager = LogManager(
     bot=bot,
     database=database,
