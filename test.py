@@ -15,8 +15,6 @@ def build_test_command(manager: LogManager) -> app_commands.Command:
         member_count="Number of synthetic forum posts to create (1-10000).",
     )
     @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
     async def test(
         interaction: discord.Interaction,
         member_count: app_commands.Range[int, 1, 10000],
