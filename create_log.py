@@ -38,6 +38,8 @@ THREAD_NAME_LIMIT = 100
 # second gap, then adapt from Discord's X-RateLimit-* headers. This is not a
 # claimed Discord limit; it is only a cold-start safety interval.
 FORUM_INITIAL_INTERVAL = 1.25
+FORUM_MIN_INTERVAL = 1.0
+FORUM_MAX_INTERVAL = 3.0
 FORUM_SAFETY_FACTOR = 1.00
 FORUM_SAFETY_MARGIN = 0.10
 FORUM_RETRY_MARGIN = 0.50
@@ -77,7 +79,6 @@ class ForumCreatePacer:
         # otherwise bind to the loop that happened to be current at import.
         self._lock: Optional[asyncio.Lock] = None
         self._next_start = time.monotonic() + FORUM_INITIAL_INTERVAL
-        self._blocked_until = self._next_start
         self._interval = FORUM_INITIAL_INTERVAL
         self.limit: Optional[int] = None
         self.remaining: Optional[int] = None
@@ -116,40 +117,43 @@ class ForumCreatePacer:
             if reset_after is not None and reset_after >= 0:
                 self.reset_after = reset_after
 
-            # Discord says these headers are the source of truth for the
-            # current bucket. Spread requests across the observed window,
-            # then add a small margin. Request starts are paced against this
-            # interval (not interval-after-response), so API latency does not
-            # get added a second time to every item.
-            if self.reset_after is not None:
-                if self.limit:
-                    # Pace from the observed reset window and full bucket
-                    # limit. A minimum one-second gap plus a small margin
-                    # avoids bursts without adding response latency twice.
-                    derived = (
-                        (self.reset_after / self.limit) * FORUM_SAFETY_FACTOR
-                        + FORUM_SAFETY_MARGIN
-                    )
-                    self._interval = max(1.0, derived)
+            # Use only headers present on THIS response to adjust the pacing
+            # estimate. Do not block here when remaining reaches zero: discord.py
+            # already owns the route/global bucket state and waits for its reset.
+            # A second application-level reset timer can stall a job by reusing a
+            # stale Reset-After value when a later response omits that header.
+            if limit is not None and limit > 0 and reset_after is not None and reset_after >= 0:
+                derived = (
+                    (reset_after / limit) * FORUM_SAFETY_FACTOR
+                    + FORUM_SAFETY_MARGIN
+                )
+                # This layer is only a gentle start-rate cap. discord.py remains
+                # authoritative for stricter/dynamic route, shared, and global
+                # limits, including any 429 retry_after delay.
+                self._interval = min(
+                    FORUM_MAX_INTERVAL,
+                    max(FORUM_MIN_INTERVAL, derived),
+                )
 
-            now = time.monotonic()
             if params.response.status == 429:
                 retry_after = self._float_header(headers, "Retry-After")
-                if retry_after is None:
-                    retry_after = self.reset_after or FORUM_INITIAL_INTERVAL
-                self._blocked_until = max(
-                    self._blocked_until,
-                    now + retry_after + FORUM_RETRY_MARGIN,
+                logger.warning(
+                    "Discord returned HTTP 429 for forum creation (retry-after=%s, "
+                    "scope=%s, bucket=%s); discord.py will handle the bucket wait.",
+                    retry_after,
+                    headers.get("X-RateLimit-Scope", "unknown"),
+                    self.bucket or "unknown",
                 )
-                self._interval = max(
-                    self._interval,
-                    retry_after + FORUM_RETRY_MARGIN,
-                )
-            elif self.remaining == 0 and self.reset_after is not None:
-                self._blocked_until = max(
-                    self._blocked_until,
-                    now + self.reset_after + FORUM_SAFETY_MARGIN,
-                )
+            logger.debug(
+                "Forum-create response: status=%s limit=%s remaining=%s reset_after=%s "
+                "bucket=%s pacing_interval=%.2fs",
+                params.response.status,
+                limit if limit is not None else "n/a",
+                remaining if remaining is not None else "n/a",
+                reset_after if reset_after is not None else "n/a",
+                self.bucket or "unknown",
+                self._interval,
+            )
         except Exception:
             logger.debug("Could not ingest forum rate-limit headers", exc_info=True)
 
@@ -162,11 +166,7 @@ class ForumCreatePacer:
 
     async def _wait_for_slot(self) -> None:
         while True:
-            delay = max(
-                0.0,
-                self._next_start - time.monotonic(),
-                self._blocked_until - time.monotonic(),
-            )
+            delay = max(0.0, self._next_start - time.monotonic())
             if delay <= 0:
                 return
             await asyncio.sleep(delay)
@@ -221,15 +221,13 @@ class ForumCreatePacer:
                         raise
 
                     retry_after = self._retry_after(exc)
-                    self.remaining = 0
-                    self._blocked_until = max(
-                        self._blocked_until,
-                        time.monotonic() + retry_after + FORUM_RETRY_MARGIN,
-                    )
-                    self._next_start = max(
-                        self._next_start,
-                        self._blocked_until,
-                    )
+                    # Normally discord.py consumes 429s internally. If one
+                    # escapes, schedule this retry from Retry-After rather than
+                    # looping immediately. This is deliberately not a separate
+                    # long-lived bucket state; the HTTP client's bucket state is
+                    # authoritative for the next request.
+                    retry_at = time.monotonic() + retry_after + FORUM_RETRY_MARGIN
+                    self._next_start = max(self._next_start, retry_at)
                     logger.warning(
                         "Forum-create request received HTTP 429; backing off %.2fs "
                         "before retry %d/%d.",
@@ -781,6 +779,14 @@ class LogManager:
             "This post is for load testing and is not a real member log."
         )
 
+        if index == 1 or index % 10 == 0 or index == self.job.total:
+            logger.info(
+                "Test batch %s: submitting forum post %d/%d.",
+                batch_id,
+                index,
+                self.job.total,
+            )
+
         await self.forum_pacer.run(
             lambda: forum_channel.create_thread(
                 name=title,
@@ -789,6 +795,14 @@ class LogManager:
                 reason="Forum load test created by /test",
             )
         )
+
+        if index == 1 or index % 10 == 0 or index == self.job.total:
+            logger.info(
+                "Test batch %s: forum post %d/%d created successfully.",
+                batch_id,
+                index,
+                self.job.total,
+            )
 
     # ------------------------------------------------------------------
     # Jobs
