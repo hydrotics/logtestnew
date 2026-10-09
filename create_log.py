@@ -23,7 +23,6 @@ import aiohttp
 
 
 import discord
-from collections import deque
 
 logger = logging.getLogger("discord-log-bot.create_log")
 
@@ -88,9 +87,6 @@ class ForumCreatePacer:
         self.reset_after: Optional[float] = None
         self.bucket: Optional[str] = None
         self._last_target_start: Optional[float] = None
-        self._recent_success_starts: deque[float] = deque(maxlen=100)
-        self._learned_min_interval = FORUM_MIN_INTERVAL
-        self._learned_interval_until = 0.0
 
         self.trace_config = aiohttp.TraceConfig()
         self.trace_config.on_request_start.append(self._on_request_start)
@@ -132,30 +128,22 @@ class ForumCreatePacer:
             if reset_after is not None and reset_after >= 0:
                 self.reset_after = reset_after
 
-            # Spread available requests across the time remaining in the
-            # current bucket. X-RateLimit-Limit alone is not sufficient: using
-            # reset_after / limit (and especially capping it at 3s) can drain
-            # the bucket before its reset and leave the next call waiting inside
-            # discord.py for a long Retry-After.
+            # Derive spacing from the bucket's TOTAL quota, not its remaining
+            # tokens. Dividing reset_after by remaining creates a pathological
+            # delay near the end of a window: with one token left and 140s until
+            # reset, the next interval becomes ~154s even though that token is
+            # still available. This is the exact pattern behind the apparent
+            # 49/50 stall. Use the full limit for the steady-state estimate.
             if reset_after is not None and reset_after >= 0:
-                if remaining is not None and remaining > 0:
+                if limit is not None and limit > 0 and reset_after > 0:
                     derived = (
-                        (reset_after / remaining) * FORUM_SAFETY_FACTOR
+                        (reset_after / limit) * FORUM_SAFETY_FACTOR
                         + FORUM_SAFETY_MARGIN
                     )
-                    now = time.monotonic()
-                    if now >= self._learned_interval_until:
-                        self._learned_min_interval = FORUM_MIN_INTERVAL
-                    self._interval = max(
-                        FORUM_MIN_INTERVAL,
-                        derived,
-                        self._learned_min_interval,
-                    )
-                elif remaining == 0 and reset_after > 0:
-                    # Avoid sending the next request into an already-exhausted
-                    # bucket. This should occur near the reset when pacing is
-                    # healthy; if it occurs early, keep the full server-advised
-                    # wait instead of provoking a 429.
+                    self._interval = max(FORUM_MIN_INTERVAL, derived)
+                if remaining == 0 and reset_after > 0:
+                    # The advertised bucket is genuinely exhausted. Do not
+                    # start another request until Discord's reset has passed.
                     reset_at = time.monotonic() + reset_after + FORUM_SAFETY_MARGIN
                     self._next_start = max(self._next_start, reset_at)
 
@@ -163,25 +151,15 @@ class ForumCreatePacer:
             scope = headers.get("X-RateLimit-Scope", "unknown")
             status_code = getattr(params.response, "status", 0)
             if status_code == 429:
-                now = time.monotonic()
-                # Shared/resource-specific limits can be invisible in successful
-                # response headers. When Discord reveals one, learn a cautious
-                # start interval from the successful attempts in this burst plus
-                # the server's Retry-After window. Keep it for the rest of the
-                # active cooldown so the next posts do not immediately repeat it.
-                if retry_after is not None and retry_after > 0:
-                    recent = [t for t in self._recent_success_starts if now - t <= 600.0]
-                    if recent:
-                        observed_window = (now - recent[0]) + retry_after
-                        learned = (observed_window / len(recent)) * FORUM_SAFETY_FACTOR + FORUM_SAFETY_MARGIN
-                    else:
-                        learned = max(self._interval * 1.25, FORUM_MIN_INTERVAL)
-                    self._learned_min_interval = max(self._learned_min_interval, learned)
-                    self._learned_interval_until = now + max(180.0, retry_after * 2.0)
-                    self._interval = max(self._interval, self._learned_min_interval)
+                # A 429 may expose a shared/resource-specific limit that cannot
+                # be inferred from successful responses. Log the server's
+                # instruction, but do NOT turn Retry-After into a permanent
+                # per-post interval: Retry-After is a cooldown, not a pacing
+                # rate. discord.py handles the actual retry/cooldown internally.
                 logger.warning(
                     "Forum-create HTTP 429: retry_after=%s scope=%s global=%s "
-                    "limit=%s remaining=%s reset_after=%s bucket=%s learned_interval=%.2fs",
+                    "limit=%s remaining=%s reset_after=%s bucket=%s "
+                    "steady_interval=%.2fs",
                     retry_after,
                     scope,
                     headers.get("X-RateLimit-Global", "false"),
@@ -191,9 +169,6 @@ class ForumCreatePacer:
                     self.bucket or "unknown",
                     self._interval,
                 )
-            else:
-                if status_code < 400 and self._last_target_start is not None:
-                    self._recent_success_starts.append(self._last_target_start)
             if status_code != 429 and (remaining is not None and (remaining <= 5 or remaining == (limit - 1 if limit else -1))):
                 logger.info(
                     "Forum-create rate-limit telemetry: status=%s limit=%s "
