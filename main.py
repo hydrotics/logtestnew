@@ -67,8 +67,14 @@ class LogBot(discord.Client):
     def __init__(self) -> None:
         super().__init__(
             intents=intents,
-            # Keep waiting indefinitely when discord.py encounters a normal
-            # route/global rate limit rather than surfacing RateLimited.
+            # Connect ForumCreatePacer's aiohttp response listener to
+            # discord.py's actual HTTP session. Without this option, the
+            # listener defined in create_log.py never sees rate-limit headers,
+            # so adaptive pacing never activates and large batches can hit a
+            # bucket limit partway through (for example around post 40).
+            http_trace=forum_pacer.trace_config,
+            # Keep waiting for Discord's advertised reset rather than
+            # surfacing RateLimited and abandoning a healthy batch.
             max_ratelimit_timeout=None,
         )
         self.tree = app_commands.CommandTree(self)
