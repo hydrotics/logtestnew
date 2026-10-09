@@ -34,9 +34,6 @@ DATABASE_PATH = os.getenv(
 )
 
 try:
-    # This remains the role whose members receive log threads. It is not the
-    # staff-permission role configured with /settings.
-    ROLE_ID = int(os.getenv("DISCORD_ROLE_ID", "0"))
     # Optional initial forum. /settings can set or change it and the selection
     # is persisted in SQLite.
     FORUM_CHANNEL_ID = int(os.getenv("DISCORD_FORUM_CHANNEL_ID", "0"))
@@ -52,18 +49,12 @@ try:
         raise ValueError("BOT_OWNER_ID must be a positive Discord user ID")
 except ValueError as exc:
     raise RuntimeError(
-        "BOT_OWNER_ID, DISCORD_ROLE_ID, DISCORD_FORUM_CHANNEL_ID, "
-        "DISCORD_GUILD_ID and CREATE_CONCURRENCY must be valid values."
+        "BOT_OWNER_ID, DISCORD_FORUM_CHANNEL_ID, DISCORD_GUILD_ID and "
+        "CREATE_CONCURRENCY must be valid values."
     ) from exc
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
-if not ROLE_ID:
-    raise RuntimeError(
-        "DISCORD_ROLE_ID is missing from .env. This is the existing role "
-        "whose members the bot creates log threads for."
-    )
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -309,16 +300,17 @@ logger.info("Using SQLite database at %s", os.path.abspath(DATABASE_PATH))
 try:
     saved_forum_id = int(database.get_setting("forum_channel_id") or "0")
     saved_staff_role_id = int(database.get_setting("staff_role_id") or "0")
+    saved_target_role_id = int(database.get_setting("target_role_id") or "0")
     saved_guild_id = int(database.get_setting("guild_id") or "0")
 except ValueError as exc:
-    raise RuntimeError("Saved forum/staff/guild settings in SQLite are invalid.") from exc
+    raise RuntimeError("Saved forum/staff/member-role/guild settings in SQLite are invalid.") from exc
 
 FORUM_CHANNEL_ID = saved_forum_id or FORUM_CHANNEL_ID
 forum_pacer.forum_channel_id = FORUM_CHANNEL_ID
 log_manager = LogManager(
     bot=bot,
     database=database,
-    role_id=ROLE_ID,
+    role_id=saved_target_role_id,
     forum_channel_id=FORUM_CHANNEL_ID,
     forum_pacer=forum_pacer,
     concurrency=CREATE_CONCURRENCY,
@@ -327,18 +319,27 @@ log_manager.staff_role_id = saved_staff_role_id
 log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
 
 
-def apply_bot_settings(forum_channel_id: int, staff_role_id: int, guild_id: int) -> None:
+def apply_bot_settings(
+    forum_channel_id: int,
+    staff_role_id: int,
+    target_role_id: int,
+    auto_create_enabled: bool,
+    guild_id: int,
+) -> None:
     """Persist owner-selected settings and apply them without a restart."""
     database.set_setting("forum_channel_id", str(int(forum_channel_id)))
     database.set_setting("staff_role_id", str(int(staff_role_id)))
+    database.set_setting("target_role_id", str(int(target_role_id)))
     database.set_setting("guild_id", str(int(guild_id)))
 
     log_manager.forum_channel_id = int(forum_channel_id)
     log_manager.staff_role_id = int(staff_role_id)
+    log_manager.role_id = int(target_role_id)
     log_manager.guild_id = int(guild_id)
     forum_pacer.forum_channel_id = int(forum_channel_id)
+    log_manager.set_auto_log(bool(auto_create_enabled))
 
-    if log_manager.auto_log_enabled:
+    if log_manager.auto_log_enabled and log_manager.role_id:
         log_manager.schedule_auto_reconcile(force=True)
 
 
@@ -591,6 +592,13 @@ async def auto_log(
 ) -> None:
     # Save first, then confirm (the old order could report success even if
     # saving the setting failed).
+    if enabled and not log_manager.role_id:
+        await interaction.response.send_message(
+            "Select a member role in `/settings` before enabling automatic logging.",
+            ephemeral=True,
+        )
+        return
+
     log_manager.set_auto_log(enabled)
     await interaction.response.send_message(
         content=f"Automatic logging is now **{'enabled' if enabled else 'disabled'}**.",
@@ -622,7 +630,10 @@ async def on_member_update(
     if not log_manager.forum_channel_id or not log_manager.auto_log_enabled or after.bot:
         return
 
-    role = after.guild.get_role(ROLE_ID)
+    role_id = log_manager.role_id
+    if not role_id:
+        return
+    role = after.guild.get_role(role_id)
     if role is None:
         return
 
