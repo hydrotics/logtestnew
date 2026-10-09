@@ -598,10 +598,17 @@ class LogManager:
         return channel
 
     async def fetch_role_members(self, guild: discord.Guild) -> list[discord.Member]:
+        if not self.role_id:
+            raise RuntimeError(
+                "No member role is configured. Use /settings to choose the role "
+                "whose members should receive logs."
+            )
+
         role = guild.get_role(self.role_id)
         if role is None:
             raise RuntimeError(
-                f"DISCORD_ROLE_ID ({self.role_id}) was not found in {guild.name}."
+                f"The configured member role ({self.role_id}) was not found in "
+                f"{guild.name}. Use /settings to select a valid role."
             )
 
         if not guild.chunked:
@@ -997,7 +1004,7 @@ class LogManager:
 
     async def ensure_member_has_log(self, member: discord.Member) -> bool:
         """Queue an automatic log for `member`. Returns True if queued."""
-        if not self.auto_log_enabled or member.bot:
+        if not self.auto_log_enabled or not self.role_id or member.bot:
             return False
 
         forum_channel = await self.get_forum_channel()
@@ -1019,7 +1026,7 @@ class LogManager:
         Reconciliation is intentionally cooldown-limited so transient Discord
         gateway reconnects do not cause repeated full scans of archived posts.
         """
-        if not self.auto_log_enabled:
+        if not self.auto_log_enabled or not self.role_id or not self.forum_channel_id:
             return
         if self._auto_reconcile_task is not None and not self._auto_reconcile_task.done():
             return
@@ -1036,7 +1043,7 @@ class LogManager:
 
     async def reconcile_auto_logs(self) -> None:
         """Repair persisted log state and queue every current member missing a log."""
-        if not self.auto_log_enabled:
+        if not self.auto_log_enabled or not self.role_id or not self.forum_channel_id:
             return
 
         try:
