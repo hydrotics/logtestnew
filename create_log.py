@@ -38,8 +38,8 @@ THREAD_NAME_LIMIT = 100
 # second gap, then adapt from Discord's X-RateLimit-* headers. This is not a
 # claimed Discord limit; it is only a cold-start safety interval.
 FORUM_INITIAL_INTERVAL = 1.25
-FORUM_SAFETY_FACTOR = 1.20
-FORUM_SAFETY_MARGIN = 0.15
+FORUM_SAFETY_FACTOR = 1.00
+FORUM_SAFETY_MARGIN = 0.10
 FORUM_RETRY_MARGIN = 0.50
 MAX_FORUM_429_RETRIES = 5
 
@@ -118,15 +118,14 @@ class ForumCreatePacer:
 
             # Discord says these headers are the source of truth for the
             # current bucket. Spread requests across the observed window,
-            # then add margin so clock/transport skew does not create a burst.
+            # then add a small margin. Request starts are paced against this
+            # interval (not interval-after-response), so API latency does not
+            # get added a second time to every item.
             if self.reset_after is not None:
                 if self.limit:
-                    # Pace against the bucket's *full limit*, not its
-                    # dwindling remaining count. Dividing reset_after by
-                    # remaining makes the interval grow dramatically near the
-                    # end of a window (e.g. ~60s when one token remains), which
-                    # looks like the job is stuck at 49/50. Keep a minimum
-                    # one-second gap between create attempts and add a margin.
+                    # Pace from the observed reset window and full bucket
+                    # limit. A minimum one-second gap plus a small margin
+                    # avoids bursts without adding response latency twice.
                     derived = (
                         (self.reset_after / self.limit) * FORUM_SAFETY_FACTOR
                         + FORUM_SAFETY_MARGIN
@@ -208,10 +207,13 @@ class ForumCreatePacer:
                 started = time.monotonic()
                 try:
                     result = await call()
+                    # Pace *start-to-start*. Do not add the interval again
+                    # after the response completes: that made each cycle
+                    # request latency + interval (e.g. a 3.1s interval plus
+                    # 0.7s API latency became 3.8s per post).
                     self._next_start = max(
                         self._next_start,
                         started + self._interval,
-                        time.monotonic() + self._interval,
                     )
                     return result
                 except discord.HTTPException as exc:
