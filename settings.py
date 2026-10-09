@@ -57,10 +57,7 @@ def build_settings_command(
         )
         target_role = discord.ui.Label(
             text="Member role to create logs for",
-            description=(
-                "Only members with this role receive logs. "
-                "Leave blank to disable manual and automatic member logging."
-            ),
+            description="Members with this role get logs. Leave blank to disable member logging.",
             component=discord.ui.RoleSelect(
                 placeholder="Select the role whose members get logs",
                 min_values=0,
@@ -74,8 +71,8 @@ def build_settings_command(
         auto_create = discord.ui.Label(
             text="Auto create logs",
             description=(
-                "True creates logs for current matching members and new members "
-                "who join or receive the selected member role."
+                "If True, logs are created for current matching members and "
+                "when members join or gain the role."
             ),
             component=discord.ui.Select(
                 placeholder="Enable or disable automatic log creation",
