@@ -21,6 +21,7 @@ from create_log import (
 )
 from render import KeepAliveServer
 from test import build_test_command
+from settings import build_settings_command
 
 load_dotenv()
 
@@ -33,23 +34,35 @@ DATABASE_PATH = os.getenv(
 )
 
 try:
+    # This remains the role whose members receive log threads. It is not the
+    # staff-permission role configured with /settings.
     ROLE_ID = int(os.getenv("DISCORD_ROLE_ID", "0"))
+    # Optional initial forum. /settings can set or change it and the selection
+    # is persisted in SQLite.
     FORUM_CHANNEL_ID = int(os.getenv("DISCORD_FORUM_CHANNEL_ID", "0"))
+    DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
     # Kept for compatibility with existing deployments. The forum-create route
     # is deliberately single-flight in LogManager to prevent request bursts.
     CREATE_CONCURRENCY = int(os.getenv("CREATE_CONCURRENCY", "1"))
+    owner_id_value = os.getenv("BOT_OWNER_ID", "").strip()
+    if not owner_id_value:
+        raise RuntimeError("BOT_OWNER_ID is missing from .env")
+    BOT_OWNER_ID = int(owner_id_value)
+    if BOT_OWNER_ID <= 0:
+        raise ValueError("BOT_OWNER_ID must be a positive Discord user ID")
 except ValueError as exc:
     raise RuntimeError(
-        "DISCORD_ROLE_ID, DISCORD_FORUM_CHANNEL_ID and CREATE_CONCURRENCY "
-        "must be valid values."
+        "BOT_OWNER_ID, DISCORD_ROLE_ID, DISCORD_FORUM_CHANNEL_ID, "
+        "DISCORD_GUILD_ID and CREATE_CONCURRENCY must be valid values."
     ) from exc
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
 if not ROLE_ID:
-    raise RuntimeError("DISCORD_ROLE_ID is missing from .env")
-if not FORUM_CHANNEL_ID:
-    raise RuntimeError("DISCORD_FORUM_CHANNEL_ID is missing from .env")
+    raise RuntimeError(
+        "DISCORD_ROLE_ID is missing from .env. This is the existing role "
+        "whose members the bot creates log threads for."
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +72,63 @@ logger = logging.getLogger("discord-log-bot")
 
 intents = discord.Intents.default()
 intents.members = True
+
+
+class LogCommandTree(app_commands.CommandTree):
+    """Apply the owner/staff role gate to every slash command in one place."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        manager = globals().get("log_manager")
+        command_name = getattr(interaction.command, "name", "") or str(
+            (interaction.data or {}).get("name", "")
+        )
+
+        # The owner may always open /settings, including during first-run setup.
+        if command_name == "settings" and interaction.user.id == BOT_OWNER_ID:
+            return True
+
+        # All operational commands are bound to the configured server once it
+        # is known. This also keeps globally synced first-run commands inert in
+        # other servers.
+        configured_guild_id = getattr(manager, "guild_id", 0) if manager else 0
+        if command_name != "settings" and configured_guild_id:
+            if interaction.guild_id != configured_guild_id:
+                await self._deny(
+                    interaction,
+                    "This bot is configured for a different server.",
+                )
+                return False
+
+        if interaction.user.id == BOT_OWNER_ID:
+            return True
+
+        staff_role_id = getattr(manager, "staff_role_id", 0) if manager else 0
+        if not staff_role_id:
+            await self._deny(
+                interaction,
+                "The bot has no staff role configured yet. Only the bot owner can use commands until one is set with `/settings`.",
+            )
+            return False
+
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None or not any(role.id == staff_role_id for role in member.roles):
+            await self._deny(
+                interaction,
+                "You need the configured staff role to use this bot.",
+            )
+            return False
+
+        return True
+
+    @staticmethod
+    async def _deny(interaction: discord.Interaction, message: str) -> None:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            logger.debug("Could not send command permission denial", exc_info=True)
 
 
 class LogBot(discord.Client):
@@ -77,7 +147,7 @@ class LogBot(discord.Client):
             # surfacing RateLimited and abandoning a healthy batch.
             max_ratelimit_timeout=None,
         )
-        self.tree = app_commands.CommandTree(self)
+        self.tree = LogCommandTree(self)
         self.commands_ready = asyncio.Event()
         self.command_setup_error: Exception | None = None
         self.keepalive = KeepAliveServer(self._health_snapshot)
@@ -93,62 +163,83 @@ class LogBot(discord.Client):
         }
 
     async def setup_hook(self) -> None:
-        """Start the keep-alive server, then register the guild commands once."""
+        """Start keep-alive and register commands in the configured guild."""
         # Bind the port FIRST so Render sees an open port immediately.
         try:
             await self.keepalive.start()
         except Exception:
             logger.exception("Keep-alive server failed to start")
 
-        last_error: Exception | None = None
+        # A guild ID can be inferred from the configured forum, supplied via
+        # DISCORD_GUILD_ID, or loaded from the settings saved by /settings.
+        guild_id = log_manager.guild_id or DISCORD_GUILD_ID
+        if not guild_id and log_manager.forum_channel_id:
+            try:
+                configured_forum = await log_manager.get_forum_channel()
+                guild_id = configured_forum.guild.id
+                log_manager.guild_id = guild_id
+            except Exception:
+                logger.warning(
+                    "Could not infer the command guild from the configured forum; "
+                    "falling back to global command registration so /settings remains available.",
+                    exc_info=True,
+                )
 
+        last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
-                forum = await log_manager.get_forum_channel()
-                guild = discord.Object(id=forum.guild.id)
-
                 current_commands = (
                     create_log,
                     status,
                     auto_log,
                     build_test_command(log_manager),
+                    build_settings_command(
+                        owner_id=BOT_OWNER_ID,
+                        manager=log_manager,
+                        apply_settings=apply_bot_settings,
+                    ),
                 )
 
-                for command in current_commands:
-                    self.tree.add_command(command, guild=guild, override=True)
-
-                synced = await self.tree.sync(guild=guild)
+                if guild_id:
+                    guild = discord.Object(id=guild_id)
+                    for command in current_commands:
+                        self.tree.add_command(command, guild=guild, override=True)
+                    synced = await self.tree.sync(guild=guild)
+                else:
+                    # First-run fallback: global syncing allows the owner to
+                    # open /settings even when no forum/guild ID is configured.
+                    for command in current_commands:
+                        self.tree.add_command(command, override=True)
+                    synced = await self.tree.sync()
 
                 names = sorted(command.name for command in synced)
-                expected = ["auto_log", "create_log", "status", "test"]
-
+                expected = ["auto_log", "create_log", "settings", "status", "test"]
                 if names != expected:
                     raise RuntimeError(
-                        "Guild command sync verification failed. "
+                        "Command sync verification failed. "
                         f"Expected {expected}, got {names}."
                     )
 
                 status_command = next(c for c in synced if c.name == "status")
                 log_manager.status_mention = status_command.mention
 
-                # Only after guild commands are confirmed do we remove stale
-                # global commands.
-                self.tree.clear_commands(guild=None)
-                try:
-                    await self.tree.sync()
-                except Exception:
-                    logger.warning(
-                        "Could not remove old global commands; guild commands are still ready.",
-                        exc_info=True,
-                    )
+                # Remove stale global copies only when we synced guild-scoped
+                # commands. In first-run global mode, clearing globals would
+                # remove /settings itself.
+                if guild_id:
+                    self.tree.clear_commands(guild=None)
+                    try:
+                        await self.tree.sync()
+                    except Exception:
+                        logger.warning(
+                            "Could not remove old global commands; guild commands are still ready.",
+                            exc_info=True,
+                        )
 
-                # BUG FIX: forum.guild is only a bare discord.Object here (the
-                # guild cache is empty during setup_hook), so `.name` raised
-                # AttributeError, setup "failed" three times, and
-                # commands_ready was never set.
                 logger.info(
-                    "Commands ready in guild %s: %s",
-                    forum.guild.id,
+                    "Commands ready (%s) in guild %s: %s",
+                    "guild-scoped" if guild_id else "global first-run fallback",
+                    guild_id or "not selected yet",
                     ", ".join(names),
                 )
                 self.commands_ready.set()
@@ -213,6 +304,17 @@ def _open_database(configured_path: str) -> tuple[Database, str]:
 
 database, DATABASE_PATH = _open_database(DATABASE_PATH)
 logger.info("Using SQLite database at %s", os.path.abspath(DATABASE_PATH))
+# Load settings selected in /settings. Environment forum/guild IDs are only
+# initial fallbacks; SQLite values survive restarts and take precedence.
+try:
+    saved_forum_id = int(database.get_setting("forum_channel_id") or "0")
+    saved_staff_role_id = int(database.get_setting("staff_role_id") or "0")
+    saved_guild_id = int(database.get_setting("guild_id") or "0")
+except ValueError as exc:
+    raise RuntimeError("Saved forum/staff/guild settings in SQLite are invalid.") from exc
+
+FORUM_CHANNEL_ID = saved_forum_id or FORUM_CHANNEL_ID
+forum_pacer.forum_channel_id = FORUM_CHANNEL_ID
 log_manager = LogManager(
     bot=bot,
     database=database,
@@ -221,6 +323,23 @@ log_manager = LogManager(
     forum_pacer=forum_pacer,
     concurrency=CREATE_CONCURRENCY,
 )
+log_manager.staff_role_id = saved_staff_role_id
+log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
+
+
+def apply_bot_settings(forum_channel_id: int, staff_role_id: int, guild_id: int) -> None:
+    """Persist owner-selected settings and apply them without a restart."""
+    database.set_setting("forum_channel_id", str(int(forum_channel_id)))
+    database.set_setting("staff_role_id", str(int(staff_role_id)))
+    database.set_setting("guild_id", str(int(guild_id)))
+
+    log_manager.forum_channel_id = int(forum_channel_id)
+    log_manager.staff_role_id = int(staff_role_id)
+    log_manager.guild_id = int(guild_id)
+    forum_pacer.forum_channel_id = int(forum_channel_id)
+
+    if log_manager.auto_log_enabled:
+        log_manager.schedule_auto_reconcile(force=True)
 
 
 @tree.error
@@ -229,7 +348,7 @@ async def on_app_command_error(
     error: app_commands.AppCommandError,
 ) -> None:
     if isinstance(error, app_commands.MissingPermissions):
-        message = "You need the **Administrator** permission to use this command."
+        message = "You do not have permission to use this command."
     else:
         logger.error("Unhandled command error", exc_info=error)
         message = "Something went wrong while running that command."
@@ -282,6 +401,25 @@ class ConfirmCreateLogView(discord.ui.View):
             )
             return
 
+        # Re-check current access at button time as well as command time. A
+        # staff member whose role was removed after starting the command must
+        # not be able to confirm a pending job.
+        if interaction.user.id != BOT_OWNER_ID:
+            current_staff_role_id = getattr(log_manager, "staff_role_id", 0)
+            current_member = (
+                interaction.user
+                if isinstance(interaction.user, discord.Member)
+                else None
+            )
+            if not current_staff_role_id or current_member is None or not any(
+                role.id == current_staff_role_id for role in current_member.roles
+            ):
+                await interaction.response.send_message(
+                    "You need the configured staff role to confirm this action.",
+                    ephemeral=True,
+                )
+                return
+
         if self.confirmed:
             return
 
@@ -329,15 +467,14 @@ async def run_confirmed_create_log(
             logger.debug("Could not report create-log startup error", exc_info=True)
 
 
-# Admin-only by default (commands can still be re-scoped in Server Settings ->
-# Integrations). Previously ANY member could run /test 10000 or /create_log.
+# Access to operational commands is enforced by LogCommandTree.interaction_check
+# using the configured owner ID and staff role; Discord administrator status is
+# not required when a member has the staff role.
 @app_commands.command(
     name="create_log",
     description="Create a forum post for every member with the configured role.",
 )
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
 async def create_log(interaction: discord.Interaction) -> None:
     # Acknowledge immediately so a large guild/forum scan cannot cause an
     # "application did not respond" interaction timeout.
@@ -445,8 +582,6 @@ async def status(interaction: discord.Interaction) -> None:
     description="Enable or disable automatic member logging.",
 )
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     enabled="True to enable automatic logging, false to disable it.",
 )
@@ -461,15 +596,16 @@ async def auto_log(
         content=f"Automatic logging is now **{'enabled' if enabled else 'disabled'}**.",
         ephemeral=True,
     )
-    if enabled:
+    if enabled and log_manager.forum_channel_id:
         # Enabling Auto Log also repairs/queues existing members; it is not
-        # limited to members who join after the setting is turned on.
+        # limited to members who join after the setting is turned on. If no
+        # forum has been selected yet, saving /settings will trigger this.
         log_manager.schedule_auto_reconcile(force=True)
 
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    if not log_manager.auto_log_enabled or member.bot:
+    if not log_manager.forum_channel_id or not log_manager.auto_log_enabled or member.bot:
         return
 
     try:
@@ -483,7 +619,7 @@ async def on_member_update(
     before: discord.Member,
     after: discord.Member,
 ) -> None:
-    if not log_manager.auto_log_enabled or after.bot:
+    if not log_manager.forum_channel_id or not log_manager.auto_log_enabled or after.bot:
         return
 
     role = after.guild.get_role(ROLE_ID)
@@ -500,7 +636,7 @@ async def on_member_update(
 @bot.event
 async def on_raw_thread_delete(payload: discord.RawThreadDeleteEvent) -> None:
     # Raw event: also fires for threads that were not in the cache.
-    if payload.parent_id == FORUM_CHANNEL_ID:
+    if payload.parent_id == log_manager.forum_channel_id:
         log_manager.handle_thread_delete(payload.thread_id)
 
 
@@ -519,7 +655,8 @@ async def on_ready() -> None:
         # Gateway reconnects do not guarantee that every member event that
         # occurred while offline was replayed. Reconcile persisted/Discord
         # state whenever Auto Log is enabled.
-        log_manager.schedule_auto_reconcile()
+        if log_manager.forum_channel_id:
+            log_manager.schedule_auto_reconcile()
 
 
 @bot.event
