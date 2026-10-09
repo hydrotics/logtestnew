@@ -120,21 +120,18 @@ class ForumCreatePacer:
             # current bucket. Spread requests across the observed window,
             # then add margin so clock/transport skew does not create a burst.
             if self.reset_after is not None:
-                if self.remaining is not None and self.remaining > 0:
-                    # Spread the remaining quota across the remaining window.
+                if self.limit:
+                    # Pace against the bucket's *full limit*, not its
+                    # dwindling remaining count. Dividing reset_after by
+                    # remaining makes the interval grow dramatically near the
+                    # end of a window (e.g. ~60s when one token remains), which
+                    # looks like the job is stuck at 49/50. Keep a minimum
+                    # one-second gap between create attempts and add a margin.
                     derived = (
-                        (self.reset_after / self.remaining) * FORUM_SAFETY_FACTOR
+                        (self.reset_after / self.limit) * FORUM_SAFETY_FACTOR
                         + FORUM_SAFETY_MARGIN
                     )
-                    self._interval = max(0.10, derived)
-                elif self.limit:
-                    # With no remaining tokens, the bucket is explicitly
-                    # exhausted; _blocked_until below waits for the reset.
-                    self._interval = max(
-                        self._interval,
-                        (self.reset_after / self.limit) * FORUM_SAFETY_FACTOR
-                        + FORUM_SAFETY_MARGIN,
-                    )
+                    self._interval = max(1.0, derived)
 
             now = time.monotonic()
             if params.response.status == 429:
