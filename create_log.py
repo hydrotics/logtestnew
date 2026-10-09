@@ -42,8 +42,8 @@ FORUM_MIN_INTERVAL = 1.0
 # Use a small safety buffer around Discord's advertised bucket window.
 # Do not cap the calculated interval: a hard maximum can send requests faster
 # than the bucket allows and cause discord.py to sleep through Retry-After.
-FORUM_SAFETY_FACTOR = 1.10
-FORUM_SAFETY_MARGIN = 0.10
+FORUM_SAFETY_FACTOR = 1.02
+FORUM_SAFETY_MARGIN = 0.02
 FORUM_RETRY_MARGIN = 0.50
 MAX_FORUM_429_RETRIES = 5
 
@@ -128,28 +128,31 @@ class ForumCreatePacer:
             if reset_after is not None and reset_after >= 0:
                 self.reset_after = reset_after
 
-            # Derive spacing from the bucket's TOTAL quota, not its remaining
-            # tokens. Dividing reset_after by remaining creates a pathological
-            # delay near the end of a window: with one token left and 140s until
-            # reset, the next interval becomes ~154s even though that token is
-            # still available. This is the exact pattern behind the apparent
-            # 49/50 stall. Use the full limit for the steady-state estimate.
-            if reset_after is not None and reset_after >= 0:
-                if limit is not None and limit > 0 and reset_after > 0:
+            status_code = getattr(params.response, "status", 0)
+            retry_after = self._float_header(headers, "Retry-After")
+            scope = headers.get("X-RateLimit-Scope", "unknown")
+
+            # Pace using the *remaining* quota and the time left in this
+            # window. Both values fall together as requests are made, so their
+            # ratio stays approximately constant. Using reset_after / limit
+            # instead makes the interval shrink throughout the window, which
+            # can consume the bucket early and trigger Discord's long cooldown.
+            #
+            # When one token remains, keep the already-learned steady interval
+            # so that available token is not delayed for the entire reset
+            # window. If a successful response says remaining=0, schedule the
+            # next request after reset. On 429 responses, do not add a second
+            # custom cooldown; discord.py owns the actual retry/reset wait.
+            if reset_after is not None and reset_after > 0 and status_code != 429:
+                if remaining is not None and remaining > 1:
                     derived = (
-                        (reset_after / limit) * FORUM_SAFETY_FACTOR
+                        (reset_after / remaining) * FORUM_SAFETY_FACTOR
                         + FORUM_SAFETY_MARGIN
                     )
                     self._interval = max(FORUM_MIN_INTERVAL, derived)
-                if remaining == 0 and reset_after > 0:
-                    # The advertised bucket is genuinely exhausted. Do not
-                    # start another request until Discord's reset has passed.
+                if remaining == 0:
                     reset_at = time.monotonic() + reset_after + FORUM_SAFETY_MARGIN
                     self._next_start = max(self._next_start, reset_at)
-
-            retry_after = self._float_header(headers, "Retry-After")
-            scope = headers.get("X-RateLimit-Scope", "unknown")
-            status_code = getattr(params.response, "status", 0)
             if status_code == 429:
                 # A 429 may expose a shared/resource-specific limit that cannot
                 # be inferred from successful responses. Log the server's
