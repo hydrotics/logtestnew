@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import (
     Any,
@@ -53,8 +55,19 @@ STATUS_UPDATE_SECONDS = 2.5
 ETA_GUESS_PER_ITEM = 1.0
 INTERACTION_TOKEN_SECONDS = 14 * 60   # interaction tokens die after 15 minutes
 
-_SENTINEL = object()
+# ETA: long rolling window (low noise) blended with the pacer's live interval,
+# then smoothed over time so the displayed value counts down steadily.
+ETA_WINDOW = 300           # completions used for the rate estimate
+ETA_PRIOR_WEIGHT = 5       # pseudo-samples given to the pacer's interval
+ETA_SMOOTHING_SECONDS = 60.0   # how slowly the displayed ETA follows corrections
 
+# Auto-archive: keeps the guild under Discord's 1000 active-thread cap.
+ARCHIVE_CONCURRENCY = 3
+ARCHIVE_MAX_PENDING = 25   # backpressure: creation waits if archiving falls behind
+ARCHIVE_RETRIES = 4
+ACTIVE_THREAD_LIMIT_CODE = 160006   # "Maximum number of active threads reached"
+
+_SENTINEL = object()
 
 
 # ----------------------------------------------------------------------------
@@ -91,6 +104,11 @@ class ForumCreatePacer:
         self.trace_config = aiohttp.TraceConfig()
         self.trace_config.on_request_start.append(self._on_request_start)
         self.trace_config.on_request_end.append(self._on_request_end)
+
+    @property
+    def interval(self) -> float:
+        """Current learned start-to-start interval (seconds)."""
+        return self._interval
 
     def _is_target_request(self, params: Any) -> bool:
         try:
@@ -448,6 +466,18 @@ class LogJob:
     finished_at: Optional[float] = None
     last_error: Optional[str] = None
     rate_limit_hits: int = 0
+    # Fallback seed for the ETA, used only if no live interval source is set.
+    prior_interval: float = ETA_GUESS_PER_ITEM
+    # Live source for the pacer's current learned interval.
+    interval_hint: Optional[Callable[[], float]] = field(default=None, repr=False)
+    # Timestamps of the most recent real completions (rolling window).
+    _marks: deque = field(
+        default_factory=lambda: deque(maxlen=ETA_WINDOW + 1),
+        repr=False,
+    )
+    # Smoothed ETA state (what is actually shown).
+    _eta_shown: Optional[float] = field(default=None, repr=False)
+    _eta_read_at: float = field(default=0.0, repr=False)
 
     @property
     def progress_percent(self) -> float:
@@ -462,24 +492,57 @@ class LogJob:
         end = self.finished_at or time.monotonic()
         return max(0.0, end - self.started_at)
 
+    def mark_done(self) -> None:
+        self._marks.append(time.monotonic())
+
+    def _per_item_seconds(self) -> float:
+        """Seconds per post: observed gaps blended with the pacer's interval.
+
+        The pacer's interval counts as ETA_PRIOR_WEIGHT samples, so the blend
+        shifts gradually to the observed rate with no sudden switch, and a long
+        window keeps single slow/fast posts from moving the estimate.
+        """
+        prior = self.prior_interval
+        if self.interval_hint is not None:
+            try:
+                prior = float(self.interval_hint())
+            except Exception:
+                pass
+
+        marks = self._marks
+        n = len(marks) - 1
+        observed_total = (marks[-1] - marks[0]) if n > 0 else 0.0
+        per_item = (prior * ETA_PRIOR_WEIGHT + observed_total) / (
+            ETA_PRIOR_WEIGHT + max(n, 0)
+        )
+        return max(per_item, 0.05)
+
     @property
     def eta_seconds(self) -> Optional[float]:
+        """Estimated seconds left, smoothed so it counts down steadily."""
         if not self.running:
             return 0.0
-
         remaining = max(0, self.total - self.completed)
         if remaining == 0:
             return 0.0
 
-        if self.completed == 0:
-            return remaining * ETA_GUESS_PER_ITEM
+        now = time.monotonic()
+        per_item = self._per_item_seconds()
+        last = self._marks[-1] if self._marks else (self.started_at or now)
+        in_flight = max(per_item - (now - last), 0.0)
+        target = (remaining - 1) * per_item + in_flight
 
-        elapsed = max(self.elapsed_seconds, 0.001)
-        rate = self.completed / elapsed
-        if rate <= 0:
-            return None
+        if self._eta_shown is None:
+            shown = target
+        else:
+            dt = max(0.0, now - self._eta_read_at)
+            # Count down in real time, then drift gently toward the target.
+            shown = max(0.0, self._eta_shown - dt)
+            shown += (target - shown) * (1.0 - math.exp(-dt / ETA_SMOOTHING_SECONDS))
 
-        return remaining / rate
+        self._eta_shown = shown
+        self._eta_read_at = now
+        return shown
 
 
 def make_progress_bar(current: int, total: int) -> str:
@@ -539,7 +602,6 @@ def build_status_embed(job: LogJob) -> discord.Embed:
 # ----------------------------------------------------------------------------
 # Manager
 # ----------------------------------------------------------------------------
-# ----------------------------------------------------------------------------
 class LogManager:
     def __init__(
         self,
@@ -574,9 +636,14 @@ class LogManager:
         self._consecutive_failures = 0
         self.status_mention = "`/status`"
 
+        # Background archiving of freshly created posts.
+        self._archive_tasks: set[asyncio.Task] = set()
+        self._archive_sem: Optional[asyncio.Semaphore] = None
+
         logger.info(
             "LogManager ready: forum-create single-flight queue enabled; "
-            "cold-start interval=%.2fs; adaptive header pacing active.",
+            "cold-start interval=%.2fs; adaptive header pacing active; "
+            "auto-archive enabled.",
             FORUM_INITIAL_INTERVAL,
         )
 
@@ -732,22 +799,77 @@ class LogManager:
         return pending, already_done
 
     @staticmethod
-    def _format_member_content(member: discord.Member) -> str:
+    def _format_member_content(member: discord.Member, auto: bool = False) -> str:
         account_created_timestamp = int(member.created_at.timestamp())
 
-        joined_days: int | str = "unknown"
+        # Discord timestamps render in each viewer's locale and stay current,
+        # so "x days ago" never goes stale.
         if member.joined_at is not None:
-            joined_at = member.joined_at.astimezone(timezone.utc)
-            now = datetime.now(timezone.utc)
-            joined_days = max(0, (now - joined_at).days)
+            joined_text = f"<t:{int(member.joined_at.timestamp())}:R>"
+        else:
+            joined_text = "at an unknown time"
+
+        header = "This member log was created automatically."
+        if auto:
+            header += " (+)"
 
         return (
-            "This member log was created automatically.\n\n"
+            f"{header}\n\n"
             f"User Mention: <@{member.id}>\n\n"
             "Account created: "
             f"<t:{account_created_timestamp}:F> "
-            f"(Joined the server `{joined_days}` days ago)"
+            f"(Joined the server {joined_text})"
         )
+
+    # ------------------------------------------------------------------
+    # Archiving (keeps the guild under Discord's 1000 active-thread cap)
+    # ------------------------------------------------------------------
+
+    async def _archive_thread(self, thread: discord.Thread) -> None:
+        if self._archive_sem is None:
+            self._archive_sem = asyncio.Semaphore(ARCHIVE_CONCURRENCY)
+
+        for attempt in range(ARCHIVE_RETRIES):
+            try:
+                async with self._archive_sem:
+                    await thread.edit(archived=True)
+                return
+            except discord.NotFound:
+                return
+            except discord.Forbidden:
+                self.job.last_error = (
+                    "Cannot archive posts: the bot needs the Manage Threads "
+                    "permission."
+                )
+                logger.error("Missing permission to archive thread %s", thread.id)
+                return
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "Archive attempt %d/%d failed for %s: %s",
+                    attempt + 1,
+                    ARCHIVE_RETRIES,
+                    thread.id,
+                    exc,
+                )
+                await asyncio.sleep(min(2 ** attempt, 10))
+
+        logger.error("Gave up archiving thread %s", thread.id)
+
+    async def _queue_archive(self, thread: discord.Thread) -> None:
+        # Backpressure so a stalled archive path can never let active posts
+        # pile up towards the 1000 cap.
+        while len(self._archive_tasks) >= ARCHIVE_MAX_PENDING:
+            await asyncio.sleep(0.25)
+        task = asyncio.create_task(
+            self._archive_thread(thread),
+            name=f"archive-{thread.id}",
+        )
+        self._archive_tasks.add(task)
+        task.add_done_callback(self._archive_tasks.discard)
+
+    async def drain_archives(self) -> None:
+        if self._archive_tasks:
+            await asyncio.gather(*list(self._archive_tasks), return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Thread creation
@@ -757,6 +879,7 @@ class LogManager:
         self,
         member: discord.Member,
         forum_channel: discord.ForumChannel,
+        auto: bool = False,
     ) -> Optional[discord.Thread]:
         if member.bot or member.id in self.known_logs:
             return None
@@ -765,7 +888,7 @@ class LogManager:
         # never the "[id]" suffix the whole system relies on.
         suffix = f" [{member.id}]"
         title = member.name[: THREAD_NAME_LIMIT - len(suffix)] + suffix
-        content = self._format_member_content(member)
+        content = self._format_member_content(member, auto=auto)
 
         async def create() -> Any:
             return await forum_channel.create_thread(
@@ -800,6 +923,8 @@ class LogManager:
             return None
 
         self.known_logs[member.id] = thread.id
+        # Archive right away so active threads never approach the 1000 cap.
+        await self._queue_archive(thread)
         return thread
 
     async def _create_test_post(
@@ -824,7 +949,7 @@ class LogManager:
                 self.job.total,
             )
 
-        await self.forum_pacer.run(
+        result = await self.forum_pacer.run(
             lambda: forum_channel.create_thread(
                 name=title,
                 content=content,
@@ -832,6 +957,10 @@ class LogManager:
                 reason="Forum load test created by /test",
             )
         )
+
+        created_thread = getattr(result, "thread", result)
+        if isinstance(created_thread, discord.Thread):
+            await self._queue_archive(created_thread)
 
         if index == 1 or index % 10 == 0 or index == self.job.total:
             logger.info(
@@ -853,12 +982,16 @@ class LogManager:
 
         self._abort = False
         self._consecutive_failures = 0
+        now = time.monotonic()
         self.job = LogJob(
             operation=operation,
             running=True,
             total=total,
-            started_at=time.monotonic(),
+            started_at=now,
+            prior_interval=max(self.forum_pacer.interval, FORUM_MIN_INTERVAL),
+            interval_hint=lambda: max(self.forum_pacer.interval, FORUM_MIN_INTERVAL),
         )
+        self.job._marks.append(now)
 
     async def start_member_job(self, members: list[discord.Member]) -> None:
         # Resolve the channel first (cache OR REST) so a failure can't leave a
@@ -915,12 +1048,24 @@ class LogManager:
                 # instead of pretending the request was never rate limited.
                 self.job.rate_limit_hits += 1
             error = f"Discord HTTP {exc.status}: {str(exc.text)[:200]}"
+            if exc.code == ACTIVE_THREAD_LIMIT_CODE:
+                # Cap reached (e.g. other forums' active threads count too).
+                # Retrying would only fail again, so stop with a clear message.
+                error = (
+                    "Active thread limit (1000) reached. Archive existing "
+                    "posts (this server's active threads count too) and run "
+                    "again."
+                )
+                self._abort = True
+                self.job.aborted = True
             logger.error("%s HTTP failure (%s): %s", label, exc.status, exc)
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             logger.exception("%s item failed", label)
 
         self.job.completed += 1
+        if created or error is not None:
+            self.job.mark_done()   # only real requests feed the ETA window
         if error is not None:
             self.job.failed += 1
             self.job.last_error = error
@@ -961,7 +1106,14 @@ class LogManager:
                             break
                         await self._process_item(handler, item, label)
 
-                await asyncio.gather(*(worker() for _ in range(self.concurrency)))
+                try:
+                    await asyncio.gather(
+                        *(worker() for _ in range(self.concurrency))
+                    )
+                finally:
+                    # Make sure every post is archived before the job reports
+                    # as finished.
+                    await self.drain_archives()
         finally:
             # This runs after `async with self.lock` exits, so a new job can
             # start immediately after we mark the old one finished.
@@ -1072,24 +1224,29 @@ class LogManager:
         async with self.lock:
             forum_channel: Optional[discord.ForumChannel] = None
 
-            while self._auto_queue:
-                if not self.auto_log_enabled:
-                    self._auto_queue.clear()
-                    return
+            try:
+                while self._auto_queue:
+                    if not self.auto_log_enabled:
+                        self._auto_queue.clear()
+                        return
 
-                member_id = next(iter(self._auto_queue))
-                member = self._auto_queue.pop(member_id)
+                    member_id = next(iter(self._auto_queue))
+                    member = self._auto_queue.pop(member_id)
 
-                try:
-                    if member_id in self.known_logs:
-                        continue
-                    if member.guild.get_member(member_id) is None:
-                        continue  # left the server while waiting
-                    if forum_channel is None:
-                        forum_channel = await self.get_forum_channel()
-                    await self.create_member_forum_post(member, forum_channel)
-                except Exception:
-                    logger.exception("Queued auto-log failed for %s", member_id)
+                    try:
+                        if member_id in self.known_logs:
+                            continue
+                        if member.guild.get_member(member_id) is None:
+                            continue  # left the server while waiting
+                        if forum_channel is None:
+                            forum_channel = await self.get_forum_channel()
+                        await self.create_member_forum_post(
+                            member, forum_channel, auto=True
+                        )
+                    except Exception:
+                        logger.exception("Queued auto-log failed for %s", member_id)
+            finally:
+                await self.drain_archives()
 
     def set_auto_log(self, enabled: bool) -> None:
         self.database.set_auto_log(enabled)
@@ -1161,6 +1318,8 @@ async def monitor_job_message(
             result += f" `{job.failed}` failed."
         if job.aborted:
             result += " Stopped early after repeated failures."
+        if job.last_error:
+            result += f"\nLast error: {job.last_error[:300]}"
 
     try:
         await interaction.edit_original_response(content=result, embed=None, view=None)
