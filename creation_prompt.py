@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -184,14 +185,22 @@ def setup_creation_prompt(
                     image_url = source_embed.image.url if source_embed.image else None
                     if image_url and image_url.startswith(("https://", "http://")):
                         async with aiohttp.ClientSession() as session:
-                            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                            async with session.get(
+                                image_url,
+                                timeout=aiohttp.ClientTimeout(total=20),
+                            ) as response:
                                 response.raise_for_status()
                                 data = await response.read()
                                 if data:
-                                    filename = image_url.split("?", 1)[0].rsplit("/", 1)[-1] or "creation-image.png"
+                                    filename = (
+                                        image_url.split("?", 1)[0].rsplit("/", 1)[-1]
+                                        or "creation-image.png"
+                                    )
                                     if "." not in filename:
                                         filename += ".png"
-                                    media_files.append(discord.File(BytesIO(data), filename=filename))
+                                    media_files.append(
+                                        discord.File(BytesIO(data), filename=filename)
+                                    )
 
                 if accepted:
                     channel = text_channel(
@@ -210,38 +219,97 @@ def setup_creation_prompt(
                         )
                         return
 
-                    # Publish the creation as an embed, with uploaded files attached
-                    # to the message itself. No media URLs are exposed in message text.
-                    description = source_embed.description or ""
-                    published_embed = discord.Embed(
-                        description=description,
-                        colour=ACCEPTED_COLOUR,
-                    )
-                    published_embed.add_field(
-                        name="Made by",
-                        value=f"<@{self.user_id}>",
-                        inline=False,
+                    # Publish the approved creation using Discord Components V2.
+                    # Keep every uploaded file attached to the message.
+                    submitter = (
+                        interaction.guild.get_member(self.user_id)
+                        if interaction.guild is not None
+                        else None
                     )
 
-                    # Discord embeds can display one attached image. Keep every
-                    # uploaded file attached, and render the first image in the embed.
+                    # Resolve the member's username and avatar.
+                    username = (
+                        submitter.name
+                        if submitter is not None
+                        else source_embed.author.name
+                        if source_embed.author.name
+                        else f"user-{self.user_id}"
+                    )
+
+                    avatar_url = (
+                        submitter.display_avatar.url
+                        if submitter is not None
+                        else source_embed.author.icon_url
+                        if source_embed.author.icon_url
+                        else client.user.display_avatar.url
+                    )
+
+                    # Components V2 layout.
+                    published_view = discord.ui.LayoutView(timeout=None)
+
+                    published_container = discord.ui.Container(
+                        accent_colour=ACCEPTED_COLOUR
+                    )
+
+                    # Member heading, mention, and square avatar thumbnail.
+                    published_container.add_item(
+                        discord.ui.Section(
+                            discord.ui.TextDisplay(
+                                f"# {username}\n<@{self.user_id}>"
+                            ),
+                            accessory=discord.ui.Thumbnail(
+                                media=avatar_url,
+                                description=f"{username}'s avatar",
+                            ),
+                        )
+                    )
+
+                    # Divider underneath the member information.
+                    published_container.add_item(
+                        discord.ui.Separator()
+                    )
+
+                    # Locate the first uploaded image.
                     first_image_filename: str | None = None
-                    image_extensions = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif")
-                    for index, attachment in enumerate(attachments):
+                    image_extensions = (
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".gif",
+                        ".webp",
+                        ".bmp",
+                        ".avif",
+                    )
+
+                    for attachment in attachments:
                         if (attachment.content_type or "").startswith("image/"):
                             first_image_filename = attachment.filename
                             break
+
                     if first_image_filename is None:
                         first_image_filename = next(
-                            (file.filename for file in media_files
-                             if file.filename.lower().endswith(image_extensions)),
+                            (
+                                file.filename
+                                for file in media_files
+                                if file.filename.lower().endswith(image_extensions)
+                            ),
                             None,
                         )
+
+                    # Display the first uploaded image below the divider.
                     if first_image_filename:
-                        published_embed.set_image(url=f"attachment://{first_image_filename}")
+                        published_container.add_item(
+                            discord.ui.MediaGallery(
+                                discord.MediaGalleryItem(
+                                    media=f"attachment://{first_image_filename}"
+                                )
+                            )
+                        )
+
+                    published_view.add_item(published_container)
 
                     await channel.send(
-                        embed=published_embed,
+                        view=published_view,
                         files=media_files,
                         allowed_mentions=discord.AllowedMentions(
                             users=[discord.Object(id=self.user_id)]
@@ -273,7 +341,12 @@ def setup_creation_prompt(
                     view=review_view(self.user_id, disabled=True),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-            except (discord.HTTPException, OSError, aiohttp.ClientError, ValueError):
+            except (
+                discord.HTTPException,
+                OSError,
+                aiohttp.ClientError,
+                ValueError,
+            ):
                 logger.exception(
                     "Could not process creation review for %s (message %s)",
                     self.user_id,
@@ -327,7 +400,9 @@ def setup_creation_prompt(
                 )
                 return
 
-            channel = text_channel(interaction.guild, manager.creation_approve_channel_id)
+            channel = text_channel(
+                interaction.guild, manager.creation_approve_channel_id
+            )
             if channel is None:
                 await reply(interaction, "Submissions are currently unavailable.")
                 return
@@ -335,7 +410,9 @@ def setup_creation_prompt(
             await interaction.response.defer(ephemeral=True)
 
             user = interaction.user
-            uploaded_files = [await attachment.to_file() for attachment in attachments]
+            uploaded_files = [
+                await attachment.to_file() for attachment in attachments
+            ]
             embed = discord.Embed(
                 description=self.details.component.value,
                 colour=EMBED_COLOUR,
@@ -346,7 +423,10 @@ def setup_creation_prompt(
                 value=f"**Submitted by:** {user.mention}\n**Status:** Pending review",
                 inline=False,
             )
-            filenames = "\n".join(f"• `{uploaded_file.filename}`" for uploaded_file in uploaded_files)
+            filenames = "\n".join(
+                f"• `{uploaded_file.filename}`"
+                for uploaded_file in uploaded_files
+            )
             embed.add_field(
                 name=f"Attachments ({len(uploaded_files)})",
                 value=filenames[:1024],
@@ -363,14 +443,19 @@ def setup_creation_prompt(
             except discord.HTTPException:
                 for uploaded_file in uploaded_files:
                     uploaded_file.close()
-                logger.exception("Could not forward creation submission from %s", user.id)
+                logger.exception(
+                    "Could not forward creation submission from %s", user.id
+                )
                 await reply(
                     interaction,
                     "Your submission could not be sent. Please try again later.",
                 )
                 return
 
-            await reply(interaction, "Your creation has been submitted for staff approval.")
+            await reply(
+                interaction,
+                "Your creation has been submitted for staff approval.",
+            )
 
     def prompt_embed() -> discord.Embed:
         return discord.Embed(
@@ -387,7 +472,9 @@ def setup_creation_prompt(
         _prompt_messages[channel.id] = message.id
         return message
 
-    async def find_prompt_message(channel: discord.TextChannel) -> discord.Message | None:
+    async def find_prompt_message(
+        channel: discord.TextChannel,
+    ) -> discord.Message | None:
         prompt_id = _prompt_messages.get(channel.id)
         if prompt_id is not None:
             try:
@@ -395,7 +482,10 @@ def setup_creation_prompt(
             except discord.NotFound:
                 _prompt_messages.pop(channel.id, None)
             except discord.HTTPException:
-                logger.exception("Could not fetch tracked creation prompt in channel %s", channel.id)
+                logger.exception(
+                    "Could not fetch tracked creation prompt in channel %s",
+                    channel.id,
+                )
                 return None
 
         # Recover the latest prompt after a bot restart, when the in-memory ID is lost.
@@ -403,7 +493,10 @@ def setup_creation_prompt(
             async for old_message in channel.history(limit=50):
                 if old_message.author.id != client.user.id:
                     continue
-                if not any(embed.title == "Upload your creation" for embed in old_message.embeds):
+                if not any(
+                    embed.title == "Upload your creation"
+                    for embed in old_message.embeds
+                ):
                     continue
                 if any(
                     getattr(component, "custom_id", None) == PROMPT_SELECT_ID
@@ -413,7 +506,10 @@ def setup_creation_prompt(
                     _prompt_messages[channel.id] = old_message.id
                     return old_message
         except discord.HTTPException:
-            logger.exception("Could not search for the existing creation prompt in channel %s", channel.id)
+            logger.exception(
+                "Could not search for the existing creation prompt in channel %s",
+                channel.id,
+            )
         return None
 
     async def on_prompt_channel_message(message: discord.Message) -> None:
@@ -422,7 +518,9 @@ def setup_creation_prompt(
         # messages are ignored.
         if message.guild is None:
             return
-        channel = text_channel(message.guild, manager.creation_prompt_channel_id)
+        channel = text_channel(
+            message.guild, manager.creation_prompt_channel_id
+        )
         if channel is None or message.channel.id != channel.id:
             return
 
@@ -437,7 +535,8 @@ def setup_creation_prompt(
         is_prompt_message = message.id == _prompt_messages.get(channel.id)
         if not is_prompt_message:
             is_prompt_message = any(
-                embed.title == "Upload your creation" for embed in message.embeds
+                embed.title == "Upload your creation"
+                for embed in message.embeds
             ) and any(
                 getattr(component, "custom_id", None) == PROMPT_SELECT_ID
                 for row in message.components
@@ -455,12 +554,16 @@ def setup_creation_prompt(
                 except discord.NotFound:
                     pass
                 except discord.HTTPException:
-                    logger.exception("Could not delete old creation prompt %s", old_prompt.id)
+                    logger.exception(
+                        "Could not delete old creation prompt %s", old_prompt.id
+                    )
                     # Still send a fresh prompt so the upload control remains available.
             try:
                 await send_prompt(channel)
             except discord.HTTPException:
-                logger.exception("Could not resend creation prompt in channel %s", channel.id)
+                logger.exception(
+                    "Could not resend creation prompt in channel %s", channel.id
+                )
 
     class PromptView(discord.ui.View):
         def __init__(self) -> None:
@@ -482,8 +585,12 @@ def setup_creation_prompt(
             interaction: discord.Interaction,
             select: discord.ui.Select,
         ) -> None:
-            if text_channel(interaction.guild, manager.creation_approve_channel_id) is None:
-                await reply(interaction, "Submissions are currently unavailable.")
+            if text_channel(
+                interaction.guild, manager.creation_approve_channel_id
+            ) is None:
+                await reply(
+                    interaction, "Submissions are currently unavailable."
+                )
             else:
                 await interaction.response.send_modal(SubmissionModal())
 
@@ -500,7 +607,9 @@ def setup_creation_prompt(
     async def creation_prompt(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        channel = text_channel(interaction.guild, manager.creation_prompt_channel_id)
+        channel = text_channel(
+            interaction.guild, manager.creation_prompt_channel_id
+        )
         if channel is None or text_channel(
             interaction.guild, manager.creation_approve_channel_id
         ) is None:
@@ -526,7 +635,9 @@ def setup_creation_prompt(
             )
             return
 
-        await reply(interaction, f"Creation prompt sent to {channel.mention}.")
+        await reply(
+            interaction, f"Creation prompt sent to {channel.mention}."
+        )
 
     client_key = id(client)
     if client_key not in _registered_clients:
@@ -538,7 +649,9 @@ def setup_creation_prompt(
         # preserving any handler the application already defines.
         original_on_message = getattr(client, "on_message", None)
 
-        async def combined_on_message(self_client, message: discord.Message) -> None:
+        async def combined_on_message(
+            self_client, message: discord.Message
+        ) -> None:
             if original_on_message is not None:
                 result = original_on_message(message)
                 if hasattr(result, "__await__"):
