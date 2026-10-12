@@ -8,8 +8,8 @@ from discord import app_commands
 
 logger = logging.getLogger("discord-log-bot.settings")
 
-# forum channel, staff role, target/member role, auto-create enabled, guild ID
 ApplySettings = Callable[[int, int, int, bool, int], None]
+ApplyCreationSettings = Callable[[int, int], None]
 
 
 def build_settings_command(
@@ -17,9 +17,8 @@ def build_settings_command(
     owner_id: int,
     manager: Any,
     apply_settings: ApplySettings,
+    apply_creation_settings: ApplyCreationSettings,
 ) -> app_commands.Command:
-    """Build owner-only /settings and its persistent configuration modal."""
-
     class BotSettingsModal(discord.ui.Modal, title="Bot Settings"):
         forum_channel = discord.ui.Label(
             text="Forum channel",
@@ -30,11 +29,6 @@ def build_settings_command(
                 min_values=1,
                 max_values=1,
                 required=True,
-                default_values=(
-                    [discord.Object(id=manager.forum_channel_id)]
-                    if manager.forum_channel_id
-                    else []
-                ),
             ),
         )
         staff_role = discord.ui.Label(
@@ -48,11 +42,6 @@ def build_settings_command(
                 min_values=0,
                 max_values=1,
                 required=False,
-                default_values=(
-                    [discord.Object(id=manager.staff_role_id)]
-                    if manager.staff_role_id
-                    else []
-                ),
             ),
         )
         target_role = discord.ui.Label(
@@ -63,16 +52,13 @@ def build_settings_command(
                 min_values=0,
                 max_values=1,
                 required=False,
-                default_values=(
-                    [discord.Object(id=manager.role_id)] if manager.role_id else []
-                ),
             ),
         )
         auto_create = discord.ui.Label(
             text="Auto create logs",
             description=(
-                "If True, logs are created for current matching members and "
-                "when members join or gain the role."
+                "Create logs for current matching members and when members "
+                "join or gain the role."
             ),
             component=discord.ui.Select(
                 placeholder="Enable or disable automatic log creation",
@@ -93,12 +79,20 @@ def build_settings_command(
                 ],
             ),
         )
+        creation_channels = discord.ui.Label(
+            text="Creation prompt and approval channels",
+            description="Choose prompt first, then approval. Select none to clear both.",
+            component=discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Select prompt first, then approval",
+                min_values=0,
+                max_values=2,
+                required=False,
+            ),
+        )
 
         def __init__(self) -> None:
             super().__init__(timeout=300)
-
-            # Keep the defaults in the modal current if settings have changed
-            # since startup (for example, via the /auto_log command).
             self.forum_channel.component.default_values = (
                 [discord.Object(id=manager.forum_channel_id)]
                 if manager.forum_channel_id
@@ -126,9 +120,16 @@ def build_settings_command(
                     default=not manager.auto_log_enabled,
                 ),
             ]
+            self.creation_channels.component.default_values = [
+                discord.Object(id=channel_id)
+                for channel_id in (
+                    manager.creation_prompt_channel_id,
+                    manager.creation_approve_channel_id,
+                )
+                if channel_id
+            ]
 
         async def on_submit(self, interaction: discord.Interaction) -> None:
-            # Defence in depth: only the configured owner may submit settings.
             if interaction.user.id != owner_id:
                 await interaction.response.send_message(
                     "Only the configured bot owner can change settings.",
@@ -152,19 +153,19 @@ def build_settings_command(
                 )
                 return
 
-            channel_values = self.forum_channel.component.values
-            if not channel_values:
+            forum_values = self.forum_channel.component.values
+            if not forum_values:
                 await interaction.response.send_message(
                     "Choose a forum channel before submitting these settings.",
                     ephemeral=True,
                 )
                 return
 
-            selected_channel_id = int(channel_values[0].id)
+            forum_id = int(forum_values[0].id)
             try:
-                forum = guild.get_channel(selected_channel_id)
+                forum = guild.get_channel(forum_id)
                 if forum is None:
-                    forum = await interaction.client.fetch_channel(selected_channel_id)
+                    forum = await interaction.client.fetch_channel(forum_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 await interaction.response.send_message(
                     "I could not access that channel. Make sure it belongs to "
@@ -228,6 +229,38 @@ def build_settings_command(
                 )
                 return
 
+            selected_creation_channels = list(self.creation_channels.component.values)
+            if len(selected_creation_channels) == 1:
+                await interaction.response.send_message(
+                    "Choose both creation channels, in this order: prompt first, approval second. "
+                    "Select none to leave both unset.",
+                    ephemeral=True,
+                )
+                return
+
+            prompt_id = 0
+            approve_id = 0
+            if len(selected_creation_channels) == 2:
+                prompt, approve = selected_creation_channels
+                prompt = guild.get_channel(int(prompt.id))
+                approve = guild.get_channel(int(approve.id))
+                if not isinstance(prompt, discord.TextChannel) or not isinstance(
+                    approve, discord.TextChannel
+                ):
+                    await interaction.response.send_message(
+                        "Both creation channels must be text channels in this server.",
+                        ephemeral=True,
+                    )
+                    return
+                if prompt.id == approve.id:
+                    await interaction.response.send_message(
+                        "The creation prompt and approval channels must be different.",
+                        ephemeral=True,
+                    )
+                    return
+                prompt_id = prompt.id
+                approve_id = approve.id
+
             try:
                 apply_settings(
                     forum.id,
@@ -236,10 +269,11 @@ def build_settings_command(
                     auto_create_enabled,
                     guild.id,
                 )
+                apply_creation_settings(prompt_id, approve_id)
             except Exception:
                 logger.exception("Could not save bot settings")
                 await interaction.response.send_message(
-                    "I could not save those settings. Check the bot logs and try again.",
+                    "I could not save all settings. Check the bot logs and try again.",
                     ephemeral=True,
                 )
                 return
@@ -248,12 +282,16 @@ def build_settings_command(
                 f"<@&{staff_role_id}>" if staff_role_id else "not set (owner-only access)"
             )
             target_text = f"<@&{target_role_id}>" if target_role_id else "not set"
+            prompt_text = f"<#{prompt_id}>" if prompt_id else "not set"
+            approve_text = f"<#{approve_id}>" if approve_id else "not set"
             await interaction.response.send_message(
                 "**Bot settings saved.**\n"
                 f"Forum channel: {forum.mention}\n"
                 f"Staff role: {staff_text}\n"
                 f"Member role to create logs for: {target_text}\n"
                 f"Auto create logs: **{auto_create_enabled}**\n"
+                f"Creation prompt channel: {prompt_text}\n"
+                f"Creation approval channel: {approve_text}\n"
                 "Only the configured owner can change these settings.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -261,7 +299,7 @@ def build_settings_command(
 
     @app_commands.command(
         name="settings",
-        description="Configure forum, staff/member roles, and automatic logging (owner only).",
+        description="Configure bot logging, roles, and creation channels (owner only).",
     )
     @app_commands.guild_only()
     async def settings(interaction: discord.Interaction) -> None:
