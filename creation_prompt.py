@@ -227,7 +227,6 @@ def setup_creation_prompt(
                         else None
                     )
 
-                    # Resolve the member's username and avatar.
                     username = (
                         submitter.name
                         if submitter is not None
@@ -248,14 +247,14 @@ def setup_creation_prompt(
                     published_view = discord.ui.LayoutView(timeout=None)
 
                     published_container = discord.ui.Container(
-                        accent_colour=ACCEPTED_COLOUR
+                        accent_colour=discord.Colour.from_rgb(36, 36, 39)
                     )
 
-                    # Member heading, mention, and square avatar thumbnail.
+                    # Username, mention, and square avatar thumbnail.
                     published_container.add_item(
                         discord.ui.Section(
                             discord.ui.TextDisplay(
-                                f"# {username}\n<@{self.user_id}>"
+                                f"## {username}\n<@{self.user_id}>"
                             ),
                             accessory=discord.ui.Thumbnail(
                                 media=avatar_url,
@@ -269,9 +268,9 @@ def setup_creation_prompt(
                         discord.ui.Separator()
                     )
 
-                    # Locate the first uploaded image.
-                    first_image_filename: str | None = None
-                    image_extensions = (
+                    # Find the first uploaded image or video.
+                    first_media_filename: str | None = None
+                    media_extensions = (
                         ".png",
                         ".jpg",
                         ".jpeg",
@@ -279,30 +278,44 @@ def setup_creation_prompt(
                         ".webp",
                         ".bmp",
                         ".avif",
+                        ".mp4",
+                        ".webm",
+                        ".mov",
+                        ".m4v",
                     )
 
                     for attachment in attachments:
-                        if (attachment.content_type or "").startswith("image/"):
-                            first_image_filename = attachment.filename
+                        content_type = attachment.content_type or ""
+                        if content_type.startswith(MEDIA_TYPES):
+                            first_media_filename = attachment.filename
                             break
 
-                    if first_image_filename is None:
-                        first_image_filename = next(
+                    if first_media_filename is None:
+                        first_media_filename = next(
                             (
                                 file.filename
                                 for file in media_files
-                                if file.filename.lower().endswith(image_extensions)
+                                if file.filename.lower().endswith(media_extensions)
                             ),
                             None,
                         )
 
-                    # Display the first uploaded image below the divider.
-                    if first_image_filename:
+                    # Display the first uploaded image or video where supported.
+                    if first_media_filename:
                         published_container.add_item(
                             discord.ui.MediaGallery(
                                 discord.MediaGalleryItem(
-                                    media=f"attachment://{first_image_filename}"
+                                    media=f"attachment://{first_media_filename}"
                                 )
+                            )
+                        )
+
+                    # Display the text entered by the submitter.
+                    submission_description = source_embed.description
+                    if submission_description:
+                        published_container.add_item(
+                            discord.ui.TextDisplay(
+                                submission_description
                             )
                         )
 
