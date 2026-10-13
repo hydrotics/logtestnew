@@ -15,6 +15,7 @@ BOOSTER_ROLE_ID = 0
 
 ApplySettings = Callable[[int, int, int, bool, int], None]
 ApplyCreationSettings = Callable[[int, int], None]
+ApplyRevealSettings = Callable[[int, int, int], None]
 
 
 def build_settings_command(
@@ -23,6 +24,7 @@ def build_settings_command(
     manager: Any,
     apply_settings: ApplySettings,
     apply_creation_settings: ApplyCreationSettings,
+    apply_reveal_settings: ApplyRevealSettings,
 ) -> app_commands.Command:
     class BotSettingsModal(discord.ui.Modal, title="Bot Settings"):
         forum_channel = discord.ui.Label(
@@ -302,9 +304,167 @@ def build_settings_command(
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
+    class RevealSettingsModal(discord.ui.Modal, title="Reveal Settings"):
+        booster_role = discord.ui.Label(
+            text="Booster access role",
+            description="Members with this role can access personalized reveals. Leave blank to disable booster access.",
+            component=discord.ui.RoleSelect(
+                placeholder="Select the booster access role (optional)",
+                min_values=0,
+                max_values=1,
+                required=False,
+            ),
+        )
+        archive_channel = discord.ui.Label(
+            text="Reveal archive channel",
+            description="Choose the text channel used to archive original reveal media. Leave blank to disable archive-backed features.",
+            component=discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Select the reveal archive channel (optional)",
+                min_values=0,
+                max_values=1,
+                required=False,
+            ),
+        )
+
+        def __init__(self) -> None:
+            super().__init__(timeout=300)
+            current_booster_role_id = int(getattr(manager, "booster_role_id", 0) or 0)
+            current_archive_channel_id = int(
+                getattr(manager, "reveal_archive_channel_id", 0) or 0
+            )
+            self.booster_role.component.default_values = (
+                [discord.Object(id=current_booster_role_id)]
+                if current_booster_role_id
+                else []
+            )
+            self.archive_channel.component.default_values = (
+                [discord.Object(id=current_archive_channel_id)]
+                if current_archive_channel_id
+                else []
+            )
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            if interaction.user.id != owner_id:
+                await interaction.response.send_message(
+                    "Only the configured bot owner can change settings.",
+                    ephemeral=True,
+                )
+                return
+
+            guild = interaction.guild
+            if guild is None:
+                await interaction.response.send_message(
+                    "Run this command inside the server you want to configure.",
+                    ephemeral=True,
+                )
+                return
+
+            if manager.job.running or manager.lock.locked():
+                await interaction.response.send_message(
+                    "Settings cannot be changed while a logging job is running. "
+                    "Try again when it finishes.",
+                    ephemeral=True,
+                )
+                return
+
+            booster_values = self.booster_role.component.values
+            booster_role_id = int(booster_values[0].id) if booster_values else 0
+            if booster_role_id == guild.id:
+                await interaction.response.send_message(
+                    "The @everyone role cannot be used as the booster access role. "
+                    "Choose a specific role or leave it blank to disable booster access.",
+                    ephemeral=True,
+                )
+                return
+            if booster_role_id and guild.get_role(booster_role_id) is None:
+                await interaction.response.send_message(
+                    "The selected booster role could not be found in this server.",
+                    ephemeral=True,
+                )
+                return
+
+            archive_values = self.archive_channel.component.values
+            archive_channel_id = int(archive_values[0].id) if archive_values else 0
+            archive_channel = None
+            if archive_channel_id:
+                archive_channel = guild.get_channel(archive_channel_id)
+                if not isinstance(archive_channel, discord.TextChannel):
+                    await interaction.response.send_message(
+                        "The selected reveal archive must be a text channel in this server.",
+                        ephemeral=True,
+                    )
+                    return
+                if archive_channel.guild.id != guild.id:
+                    await interaction.response.send_message(
+                        "The selected reveal archive channel must belong to this server.",
+                        ephemeral=True,
+                    )
+                    return
+
+            try:
+                apply_reveal_settings(archive_channel_id, booster_role_id, guild.id)
+            except Exception:
+                logger.exception("Could not save reveal settings")
+                await interaction.response.send_message(
+                    "I could not save the reveal settings. Check the bot logs and try again.",
+                    ephemeral=True,
+                )
+                return
+
+            archive_text = archive_channel.mention if archive_channel else "not set (archive-backed features disabled)"
+            booster_text = (
+                f"<@&{booster_role_id}>" if booster_role_id else "not set (booster access disabled)"
+            )
+            await interaction.response.send_message(
+                "**Reveal settings saved.**\n"
+                f"Booster access role: {booster_text}\n"
+                f"Reveal archive channel: {archive_text}\n"
+                "Only the configured owner can change these settings.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    class SettingsMenuView(discord.ui.View):
+        def __init__(self) -> None:
+            super().__init__(timeout=300)
+
+        async def _check_owner(self, interaction: discord.Interaction) -> bool:
+            if interaction.user.id != owner_id:
+                await interaction.response.send_message(
+                    "Only the configured bot owner can change settings.",
+                    ephemeral=True,
+                )
+                return False
+            if interaction.guild is None:
+                await interaction.response.send_message(
+                    "Run this command inside the server you want to configure.",
+                    ephemeral=True,
+                )
+                return False
+            return True
+
+        @discord.ui.button(label="Logging settings", style=discord.ButtonStyle.secondary)
+        async def logging_settings(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ) -> None:
+            del button
+            if not await self._check_owner(interaction):
+                return
+            await interaction.response.send_modal(BotSettingsModal())
+
+        @discord.ui.button(label="Reveal settings", style=discord.ButtonStyle.secondary)
+        async def reveal_settings(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ) -> None:
+            del button
+            if not await self._check_owner(interaction):
+                return
+            await interaction.response.send_modal(RevealSettingsModal())
+
     @app_commands.command(
         name="settings",
-        description="Configure bot logging, roles, and creation channels (owner only).",
+        description="Configure bot logging, roles, creation channels, and reveal settings (owner only).",
     )
     @app_commands.guild_only()
     async def settings(interaction: discord.Interaction) -> None:
@@ -322,6 +482,10 @@ def build_settings_command(
             )
             return
 
-        await interaction.response.send_modal(BotSettingsModal())
+        await interaction.response.send_message(
+            "Choose which bot settings to configure.",
+            view=SettingsMenuView(),
+            ephemeral=True,
+        )
 
     return settings
