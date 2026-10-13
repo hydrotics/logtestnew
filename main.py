@@ -61,7 +61,8 @@ def _bool_setting(name: str, default: bool) -> bool:
     return bool(value)
 
 
-# Secrets and the owner identity stay in .env. All other bot settings remain in settings.py.
+# Secrets and the owner identity stay in .env. All other bot settings remain in settings.py
+# or in the SQLite settings store that is managed by /settings.
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 BOT_OWNER_ID_RAW = os.getenv("BOT_OWNER_ID", "").strip()
 
@@ -91,17 +92,26 @@ except (TypeError, ValueError) as exc:
         "must be configured with valid values in settings.py."
     ) from exc
 
-if FORUM_CHANNEL_ID <= 0:
+# Forum/guild IDs are allowed to be absent on a first run because /settings can
+# configure them and the active values are persisted in SQLite. If these optional
+# constants are explicitly provided in settings.py, keep validating their values.
+if FORUM_CHANNEL_ID <= 0 and any(
+    hasattr(bot_settings, name)
+    for name in ("DISCORD_FORUM_CHANNEL_ID", "FORUM_CHANNEL_ID")
+):
     raise RuntimeError("DISCORD_FORUM_CHANNEL_ID in settings.py must be a positive Discord channel ID")
-if DISCORD_GUILD_ID <= 0:
+if DISCORD_GUILD_ID <= 0 and any(
+    hasattr(bot_settings, name)
+    for name in ("DISCORD_GUILD_ID", "GUILD_ID")
+):
     raise RuntimeError("DISCORD_GUILD_ID in settings.py must be a positive Discord server ID")
 if CREATE_CONCURRENCY <= 0:
     raise RuntimeError("CREATE_CONCURRENCY in settings.py must be a positive integer")
 
-# Reveal-specific settings are read from settings.py. Defaults keep the reveal
-# commands safely disabled until their required settings are supplied.
+# Reveal-specific defaults come from settings.py. Values saved through /settings
+# are loaded from SQLite below and take precedence over these defaults.
 REVEAL_ARCHIVE_CHANNEL_ID = int(_setting("REVEAL_ARCHIVE_CHANNEL_ID", 0) or 0)
-WATERMARK_SECRET = str(_setting("WATERMARK_SECRET", "") or "")
+WATERMARK_SECRET = os.getenv("WATERMARK_SECRET", "").strip()
 BOOSTER_ROLE_ID = int(_setting("BOOSTER_ROLE_ID", 0) or 0)
 MAX_UPLOAD_BYTES = int(
     _setting("MAX_UPLOAD_BYTES", float(_setting("MAX_UPLOAD_MB", 120) or 120) * 1048576)
@@ -267,6 +277,7 @@ class LogBot(discord.Client):
             manager=log_manager,
             apply_settings=apply_bot_settings,
             apply_creation_settings=apply_creation_settings,
+            apply_reveal_settings=apply_reveal_settings,
         )
         current_commands = (
             create_log,
@@ -417,10 +428,20 @@ try:
     saved_creation_approve_channel_id = int(
         database.get_setting("creation_approve_channel_id") or "0"
     )
+    saved_reveal_archive_channel_id = int(
+        database.get_setting("reveal_archive_channel_id")
+        or str(REVEAL_ARCHIVE_CHANNEL_ID)
+        or "0"
+    )
+    saved_booster_role_id = int(
+        database.get_setting("booster_role_id") or str(BOOSTER_ROLE_ID) or "0"
+    )
 except ValueError as exc:
     raise RuntimeError("Saved bot settings in SQLite are invalid.") from exc
 
 FORUM_CHANNEL_ID = saved_forum_id or FORUM_CHANNEL_ID
+REVEAL_ARCHIVE_CHANNEL_ID = saved_reveal_archive_channel_id
+BOOSTER_ROLE_ID = saved_booster_role_id
 forum_pacer.forum_channel_id = FORUM_CHANNEL_ID
 log_manager = LogManager(
     bot=bot,
@@ -434,6 +455,8 @@ log_manager.staff_role_id = saved_staff_role_id
 log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
 log_manager.creation_prompt_channel_id = saved_creation_prompt_channel_id
 log_manager.creation_approve_channel_id = saved_creation_approve_channel_id
+log_manager.booster_role_id = BOOSTER_ROLE_ID
+log_manager.reveal_archive_channel_id = REVEAL_ARCHIVE_CHANNEL_ID
 
 
 class _DynamicStaffRoleId:
@@ -929,6 +952,36 @@ def apply_creation_settings(prompt_channel_id: int, approve_channel_id: int) -> 
     database.set_setting("creation_approve_channel_id", str(int(approve_channel_id)))
     log_manager.creation_prompt_channel_id = int(prompt_channel_id)
     log_manager.creation_approve_channel_id = int(approve_channel_id)
+
+
+def apply_reveal_settings(
+    archive_channel_id: int,
+    booster_role_id: int,
+    guild_id: int,
+) -> None:
+    """Persist and apply reveal settings changed from the owner-only settings panel."""
+    global REVEAL_ARCHIVE_CHANNEL_ID, BOOSTER_ROLE_ID, _history_hydrated
+
+    database.set_setting("reveal_archive_channel_id", str(int(archive_channel_id)))
+    database.set_setting("booster_role_id", str(int(booster_role_id)))
+    # Record the same server as the rest of the bot configuration.
+    database.set_setting("guild_id", str(int(guild_id)))
+
+    REVEAL_ARCHIVE_CHANNEL_ID = int(archive_channel_id)
+    BOOSTER_ROLE_ID = int(booster_role_id)
+    log_manager.reveal_archive_channel_id = int(archive_channel_id)
+    log_manager.booster_role_id = int(booster_role_id)
+    log_manager.guild_id = int(guild_id)
+    reveal_history_store.archive_channel_id = int(archive_channel_id)
+
+    # Reload archive state after changing its channel. This also enables features
+    # immediately when an archive is configured after the bot has already started.
+    _history_hydrated = False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(hydrate_reveal_history(), name="hydrate-reveal-history-after-settings")
 
 
 @tree.error
@@ -1931,7 +1984,6 @@ async def trace_reveal(
         await interaction.edit_original_response(
             content=f"Trace failed ({type(exc).__name__}): {exc}"
         )
-
 
 
 @app_commands.command(
