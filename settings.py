@@ -8,6 +8,11 @@ from discord import app_commands
 
 logger = logging.getLogger("discord-log-bot.settings")
 
+# Reveal feature configuration. Replace 0 with the numeric Discord snowflake IDs.
+# These are non-secret values; WATERMARK_SECRET belongs in .env instead.
+REVEAL_ARCHIVE_CHANNEL_ID = 0
+BOOSTER_ROLE_ID = 0
+
 ApplySettings = Callable[[int, int, int, bool, int], None]
 ApplyCreationSettings = Callable[[int, int], None]
 
