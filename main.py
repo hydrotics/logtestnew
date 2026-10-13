@@ -20,6 +20,7 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 import discord
 import watermark as wm
+from dotenv import load_dotenv
 from discord import app_commands
 from PIL import Image
 
@@ -38,6 +39,7 @@ from status import StatusTracker
 from test import build_test_command
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 
 def _setting(name: str, default):
@@ -59,24 +61,42 @@ def _bool_setting(name: str, default: bool) -> bool:
     return bool(value)
 
 
-DISCORD_TOKEN = str(_setting_any(("DISCORD_TOKEN", "TOKEN"), "") or "").strip()
+# Secrets and the owner identity stay in .env. All other bot settings remain in settings.py.
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+BOT_OWNER_ID_RAW = os.getenv("BOT_OWNER_ID", "").strip()
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is missing from .env")
+
+if not BOT_OWNER_ID_RAW:
+    raise RuntimeError("BOT_OWNER_ID is missing from .env")
+
+try:
+    BOT_OWNER_ID = int(BOT_OWNER_ID_RAW)
+except (TypeError, ValueError) as exc:
+    raise RuntimeError("BOT_OWNER_ID in .env must be a valid Discord user ID") from exc
+
+if BOT_OWNER_ID <= 0:
+    raise RuntimeError("BOT_OWNER_ID in .env must be a positive Discord user ID")
+
 DATABASE_PATH = str(_setting("DATABASE_PATH", BASE_DIR / "bot_data.sqlite3"))
 
 try:
     FORUM_CHANNEL_ID = int(_setting_any(("DISCORD_FORUM_CHANNEL_ID", "FORUM_CHANNEL_ID"), 0) or 0)
     DISCORD_GUILD_ID = int(_setting_any(("DISCORD_GUILD_ID", "GUILD_ID"), 0) or 0)
     CREATE_CONCURRENCY = int(_setting_any(("CREATE_CONCURRENCY", "MAX_CONCURRENT_JOBS"), 1) or 1)
-    BOT_OWNER_ID = int(_setting_any(("BOT_OWNER_ID", "OWNER_ID"), 0) or 0)
-    if BOT_OWNER_ID <= 0:
-        raise ValueError("BOT_OWNER_ID must be a positive Discord user ID")
 except (TypeError, ValueError) as exc:
     raise RuntimeError(
-        "BOT_OWNER_ID, DISCORD_FORUM_CHANNEL_ID, DISCORD_GUILD_ID and "
-        "CREATE_CONCURRENCY must be configured with valid values in settings.py."
+        "DISCORD_FORUM_CHANNEL_ID, DISCORD_GUILD_ID and CREATE_CONCURRENCY "
+        "must be configured with valid values in settings.py."
     ) from exc
 
-if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing from settings.py")
+if FORUM_CHANNEL_ID <= 0:
+    raise RuntimeError("DISCORD_FORUM_CHANNEL_ID in settings.py must be a positive Discord channel ID")
+if DISCORD_GUILD_ID <= 0:
+    raise RuntimeError("DISCORD_GUILD_ID in settings.py must be a positive Discord server ID")
+if CREATE_CONCURRENCY <= 0:
+    raise RuntimeError("CREATE_CONCURRENCY in settings.py must be a positive integer")
 
 # Reveal-specific settings are read from settings.py. Defaults keep the reveal
 # commands safely disabled until their required settings are supplied.
