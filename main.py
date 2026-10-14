@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import math
@@ -10,17 +12,30 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-from create_log import (
-    Database,
-    ForumCreatePacer,
-    LogManager,
-    build_status_embed,
-    monitor_job_message,
-)
-from creation_prompt import setup_creation_prompt
+import create_log as create_log_module
+from create_log import Database, ForumCreatePacer, LogManager
 from render import KeepAliveServer
+
+# Keep all status/progress embeds on the configurable global embed colour,
+# including embeds created by the logging engine's monitor_job_message helper.
+_original_build_status_embed = create_log_module.build_status_embed
+
+
+def _build_status_embed_with_global_colour(job: Any) -> discord.Embed:
+    embed = _original_build_status_embed(job)
+    manager = globals().get("log_manager")
+    configured_colour = getattr(manager, "embed_colour", None) if manager else None
+    if configured_colour is not None:
+        embed.colour = configured_colour
+    return embed
+
+
+create_log_module.build_status_embed = _build_status_embed_with_global_colour
+
+from Forum_Commands.create_log_command import build_create_log_commands
+from Forum_Commands.creation_prompt_command import setup_creation_prompt
+from Forum_Commands.status_command import build_status_command
 from settings import build_settings_command
-from test import build_test_command
 
 load_dotenv()
 
@@ -165,46 +180,91 @@ class LogBot(discord.Client):
         settings_command = build_settings_command(
             owner_id=BOT_OWNER_ID,
             manager=log_manager,
-            apply_settings=apply_bot_settings,
+            apply_main_settings=apply_main_settings,
+            apply_forum_settings=apply_forum_settings,
             apply_creation_settings=apply_creation_settings,
         )
         current_commands = (
-            create_log,
-            status,
-            auto_log,
+            build_create_log_commands(manager=log_manager, owner_id=BOT_OWNER_ID),
+            build_status_command(manager=log_manager),
             creation_prompt_command,
-            build_test_command(log_manager),
             settings_command,
         )
-        expected_names = {
-            "auto_log",
-            "create_log",
-            "creation_prompt",
-            "settings",
-            "status",
-            "test",
-        }
+        expected_names = {"create_log", "creation_prompt", "settings", "status"}
 
         last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
+                previous_guild_id = int(
+                    database.get_setting("command_sync_guild_id") or "0"
+                )
+
+                # Discover every guild this application is installed in. This lets
+                # us remove old guild-scoped commands from stale/test servers too,
+                # not just from the last guild this particular database remembers.
+                guild_scope_ids: set[int] = set()
+                try:
+                    async for installed_guild in self.fetch_guilds(limit=None):
+                        guild_scope_ids.add(int(installed_guild.id))
+                except (discord.HTTPException, discord.Forbidden):
+                    logger.warning(
+                        "Could not enumerate all installed guilds; will still clean "
+                        "the configured and previously recorded guild scopes.",
+                        exc_info=True,
+                    )
+                if previous_guild_id:
+                    guild_scope_ids.add(previous_guild_id)
                 if guild_id:
-                    guild = discord.Object(id=guild_id)
+                    guild_scope_ids.add(int(guild_id))
+
+                # First remove every global command. In particular, this deletes
+                # old global copies of /test and duplicate copies of guild commands.
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                remote_global = await self.tree.fetch_commands()
+                if remote_global:
+                    raise RuntimeError(
+                        "Global command cleanup verification failed; remote global "
+                        f"commands remain: {sorted(command.name for command in remote_global)}"
+                    )
+
+                # This bot is configured for one server. Remove all guild-scoped
+                # commands from every other installed/previously recorded server.
+                for stale_guild_id in sorted(guild_scope_ids - ({int(guild_id)} if guild_id else set())):
+                    stale_guild = discord.Object(id=stale_guild_id)
+                    try:
+                        self.tree.clear_commands(guild=stale_guild)
+                        await self.tree.sync(guild=stale_guild)
+                        remaining = await self.tree.fetch_commands(guild=stale_guild)
+                    except (discord.NotFound, discord.Forbidden):
+                        # The application may have been removed from a formerly
+                        # configured server. Discord may no longer allow cleanup
+                        # there; don't block registration in the current server.
+                        logger.warning(
+                            "Could not access old command scope for guild %s; "
+                            "Discord may already have removed it with the app installation.",
+                            stale_guild_id,
+                            exc_info=True,
+                        )
+                        continue
+                    if remaining:
+                        raise RuntimeError(
+                            f"Guild command cleanup verification failed for {stale_guild_id}: "
+                            f"{sorted(command.name for command in remaining)}"
+                        )
+                    logger.info(
+                        "Removed stale guild command registrations from guild %s.",
+                        stale_guild_id,
+                    )
+
+                if guild_id:
+                    guild = discord.Object(id=int(guild_id))
                     self.tree.clear_commands(guild=guild)
-                    self.tree.clear_commands(guild=None)
                     for command in current_commands:
                         self.tree.add_command(command, guild=guild, override=True)
                     synced = await self.tree.sync(guild=guild)
-
-                    stale_global = await self.tree.fetch_commands()
-                    if stale_global:
-                        await self.tree.sync()
-                        logger.info(
-                            "Removed %d stale global command registration(s).",
-                            len(stale_global),
-                        )
                 else:
-                    self.tree.clear_commands(guild=None)
+                    # Global fallback is only used when no target guild is known.
                     for command in current_commands:
                         self.tree.add_command(command, override=True)
                     synced = await self.tree.sync()
@@ -220,12 +280,16 @@ class LogBot(discord.Client):
                     command for command in synced if command.name == "status"
                 )
                 log_manager.status_mention = status_command.mention
+                database.set_setting(
+                    "command_sync_guild_id", str(int(guild_id or 0))
+                )
 
                 logger.info(
-                    "Commands ready (%s) in guild %s: %s",
+                    "Commands ready (%s) in guild %s: %s; global registrations cleared=%s",
                     "guild-scoped" if guild_id else "global first-run fallback",
                     guild_id or "not selected yet",
                     ", ".join(sorted(synced_names)),
+                    bool(guild_id),
                 )
                 self.commands_ready.set()
                 return
@@ -302,6 +366,15 @@ try:
     saved_creation_approve_channel_id = int(
         database.get_setting("creation_approve_channel_id") or "0"
     )
+    saved_embed_colour_raw = database.get_setting("embed_colour") or "#242429"
+    if saved_embed_colour_raw.startswith("#"):
+        saved_embed_colour_raw = saved_embed_colour_raw[1:]
+    if len(saved_embed_colour_raw) != 6 or any(
+        character not in "0123456789abcdefABCDEF"
+        for character in saved_embed_colour_raw
+    ):
+        raise ValueError("embed_colour must be a six-digit hexadecimal colour")
+    saved_embed_colour_value = int(saved_embed_colour_raw, 16)
 except ValueError as exc:
     raise RuntimeError("Saved bot settings in SQLite are invalid.") from exc
 
@@ -316,25 +389,35 @@ log_manager = LogManager(
     concurrency=CREATE_CONCURRENCY,
 )
 log_manager.staff_role_id = saved_staff_role_id
+log_manager.embed_colour = discord.Colour(saved_embed_colour_value)
 log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
 log_manager.creation_prompt_channel_id = saved_creation_prompt_channel_id
 log_manager.creation_approve_channel_id = saved_creation_approve_channel_id
 
 
-def apply_bot_settings(
+def apply_main_settings(staff_role_id: int, embed_colour_value: int) -> None:
+    staff_role_id = int(staff_role_id)
+    embed_colour_value = int(embed_colour_value)
+    if not 0 <= embed_colour_value <= 0xFFFFFF:
+        raise ValueError("Embed colour must be between 0x000000 and 0xFFFFFF")
+
+    database.set_setting("staff_role_id", str(staff_role_id))
+    database.set_setting("embed_colour", f"#{embed_colour_value:06x}")
+    log_manager.staff_role_id = staff_role_id
+    log_manager.embed_colour = discord.Colour(embed_colour_value)
+
+
+def apply_forum_settings(
     forum_channel_id: int,
-    staff_role_id: int,
     target_role_id: int,
     auto_create_enabled: bool,
     guild_id: int,
 ) -> None:
     database.set_setting("forum_channel_id", str(int(forum_channel_id)))
-    database.set_setting("staff_role_id", str(int(staff_role_id)))
     database.set_setting("target_role_id", str(int(target_role_id)))
     database.set_setting("guild_id", str(int(guild_id)))
 
     log_manager.forum_channel_id = int(forum_channel_id)
-    log_manager.staff_role_id = int(staff_role_id)
     log_manager.role_id = int(target_role_id)
     log_manager.guild_id = int(guild_id)
     forum_pacer.forum_channel_id = int(forum_channel_id)
@@ -369,230 +452,6 @@ async def on_app_command_error(
             await interaction.response.send_message(message, ephemeral=True)
     except discord.HTTPException:
         logger.debug("Could not report command error", exc_info=True)
-
-
-class ConfirmCreateLogView(discord.ui.View):
-    def __init__(
-        self,
-        pending_members: list[discord.Member],
-        owner_id: int,
-        origin: discord.Interaction,
-    ) -> None:
-        super().__init__(timeout=60)
-        self.pending_members = pending_members
-        self.owner_id = owner_id
-        self.origin = origin
-        self.confirmed = False
-
-    async def on_timeout(self) -> None:
-        if self.confirmed:
-            return
-        try:
-            await self.origin.edit_original_response(
-                content="Confirmation timed out. Run `/create_log` again.",
-                view=None,
-            )
-        except discord.HTTPException:
-            pass
-
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.secondary)
-    async def confirm(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "Only the person who started this command can confirm it.",
-                ephemeral=True,
-            )
-            return
-
-        if interaction.user.id != BOT_OWNER_ID:
-            current_staff_role_id = getattr(log_manager, "staff_role_id", 0)
-            current_member = (
-                interaction.user
-                if isinstance(interaction.user, discord.Member)
-                else None
-            )
-            if not current_staff_role_id or current_member is None or not any(
-                role.id == current_staff_role_id for role in current_member.roles
-            ):
-                await interaction.response.send_message(
-                    "You need the configured staff role to confirm this action.",
-                    ephemeral=True,
-                )
-                return
-
-        if self.confirmed:
-            return
-
-        self.confirmed = True
-        await interaction.response.edit_message(
-            content="Starting member logging...",
-            view=None,
-            embed=None,
-        )
-        self.stop()
-        asyncio.create_task(
-            run_confirmed_create_log(interaction, self.pending_members),
-            name="confirmed-create-log",
-        )
-
-
-async def run_confirmed_create_log(
-    interaction: discord.Interaction,
-    pending_members: list[discord.Member],
-) -> None:
-    try:
-        if log_manager.job.running:
-            await interaction.edit_original_response(
-                content="Another logging job is already running.",
-                embed=None,
-                view=None,
-            )
-            return
-
-        await log_manager.start_member_job(pending_members)
-        await monitor_job_message(log_manager, interaction, "Creating member logs")
-    except Exception as exc:
-        logger.exception("Confirmed create-log job failed to start")
-        try:
-            await interaction.edit_original_response(
-                content=f"Could not start member logging: `{exc}`",
-                embed=None,
-                view=None,
-            )
-        except discord.HTTPException:
-            logger.debug("Could not report create-log startup error", exc_info=True)
-
-
-@app_commands.command(
-    name="create_log",
-    description="Create a forum post for every member with the configured role.",
-)
-@app_commands.guild_only()
-async def create_log(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        forum = await log_manager.get_forum_channel()
-
-        if interaction.guild_id != forum.guild.id or interaction.guild is None:
-            await interaction.edit_original_response(
-                content="This command can only be used in the configured server."
-            )
-            return
-
-        if log_manager.job.running:
-            await interaction.edit_original_response(
-                content="Another logging job is already running."
-            )
-            return
-
-        members = await log_manager.fetch_role_members(interaction.guild)
-        if not members:
-            await interaction.edit_original_response(
-                content=(
-                    "No members currently have the configured role. "
-                    "No logs were created."
-                )
-            )
-            return
-
-        pending, already_done = await log_manager.get_pending_members(members, forum)
-        if not pending:
-            await interaction.edit_original_response(
-                content=(
-                    f"All `{already_done}` members with the configured role "
-                    "already have forum logs. Nothing was created."
-                )
-            )
-            return
-
-        view = ConfirmCreateLogView(
-            pending_members=pending,
-            owner_id=interaction.user.id,
-            origin=interaction,
-        )
-        await interaction.edit_original_response(
-            content=(
-                "Are you sure you would like to create logs for "
-                f"`{len(pending)}` members?"
-            ),
-            view=view,
-        )
-
-    except Exception as exc:
-        logger.exception("create_log command failed")
-        try:
-            await interaction.edit_original_response(
-                content=f"Could not prepare member logging: `{exc}`",
-                embed=None,
-                view=None,
-            )
-        except discord.HTTPException:
-            logger.debug("Could not report create-log error", exc_info=True)
-
-
-@app_commands.command(
-    name="status",
-    description="Show the current logging progress.",
-)
-@app_commands.guild_only()
-async def status(interaction: discord.Interaction) -> None:
-    await interaction.response.send_message(
-        embed=build_status_embed(log_manager.job),
-        ephemeral=True,
-    )
-
-    if not log_manager.job.running:
-        return
-
-    deadline = asyncio.get_running_loop().time() + 14 * 60
-    while log_manager.job.running and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(2.5)
-        try:
-            await interaction.edit_original_response(
-                embed=build_status_embed(log_manager.job),
-            )
-        except discord.HTTPException:
-            return
-
-    try:
-        await interaction.edit_original_response(
-            embed=build_status_embed(log_manager.job),
-        )
-    except discord.HTTPException:
-        pass
-
-
-@app_commands.command(
-    name="auto_log",
-    description="Enable or disable automatic member logging.",
-)
-@app_commands.guild_only()
-@app_commands.describe(
-    enabled="True to enable automatic logging, false to disable it.",
-)
-async def auto_log(
-    interaction: discord.Interaction,
-    enabled: bool,
-) -> None:
-    if enabled and not log_manager.role_id:
-        await interaction.response.send_message(
-            "Select a member role in `/settings` before enabling automatic logging.",
-            ephemeral=True,
-        )
-        return
-
-    log_manager.set_auto_log(enabled)
-    await interaction.response.send_message(
-        content=f"Automatic logging is now **{'enabled' if enabled else 'disabled'}**.",
-        ephemeral=True,
-    )
-    if enabled and log_manager.forum_channel_id:
-        log_manager.schedule_auto_reconcile(force=True)
 
 
 @bot.event
