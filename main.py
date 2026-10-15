@@ -40,7 +40,7 @@ from settings import build_settings_command
 load_dotenv()
 
 # Imported after load_dotenv() so WATERMARK_SECRET is available to the module.
-import booster
+from booster_commands import booster
 
 # Only these three values live in .env:
 #   DISCORD_TOKEN, WATERMARK_SECRET (read by booster.py), BOT_OWNER_ID
