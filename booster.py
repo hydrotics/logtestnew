@@ -26,11 +26,28 @@ import discord
 from discord import app_commands
 from PIL import Image
 
-from reveal_history import ArchiveServedUsersView, RevealHistoryError, RevealHistoryStore, make_history_command
-from stresstest import install_stress_test
-from status import StatusTracker
-
 BASE_DIR = Path(__file__).resolve().parent
+
+# This file lives in the booster_commands/ folder next to reveal_history.py,
+# stresstest.py, status.py and watermark.py. Make the folder importable so any
+# plain sibling imports inside those files keep working.
+if str(BASE_DIR) not in sys.path:
+    sys.path.append(str(BASE_DIR))
+
+try:
+    from reveal_history import ArchiveServedUsersView, RevealHistoryError, RevealHistoryStore, make_history_command
+    from stresstest import install_stress_test
+    from status import StatusTracker
+except ImportError:
+    # Fallback if those files use package-relative imports internally.
+    from booster_commands.reveal_history import (
+        ArchiveServedUsersView,
+        RevealHistoryError,
+        RevealHistoryStore,
+        make_history_command,
+    )
+    from booster_commands.stresstest import install_stress_test
+    from booster_commands.status import StatusTracker
 
 # ---------------------------------------------------------------------------
 # Secrets / configuration
