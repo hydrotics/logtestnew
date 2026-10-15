@@ -529,13 +529,10 @@ def build_settings_command(
                 f"Staff team role: {staff_text}\n"
                 f"Reveal archive channel: {archive_text}"
             )
-            if (
-                staff_team_role_id != previous_staff_team_role_id
-                or archive_channel_id != previous_archive_channel_id
-            ):
+            if staff_team_role_id != previous_staff_team_role_id:
                 message += (
-                    "\nRestart the bot to apply the staff team role and reveal archive "
-                    "channel to the reveal history and stress-test tools."
+                    "\nRestart the bot to apply the staff team role to the reveal "
+                    "history and stress-test tools."
                 )
             await reply(interaction, message)
 
