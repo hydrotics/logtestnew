@@ -39,9 +39,6 @@ from settings import build_settings_command
 
 load_dotenv()
 
-# Imported after load_dotenv() so WATERMARK_SECRET is available to the module.
-from booster_commands import booster
-
 # Only these three values live in .env:
 #   DISCORD_TOKEN, WATERMARK_SECRET (read by booster.py), BOT_OWNER_ID
 # Everything else is configured through /settings and stored in SQLite.
@@ -424,6 +421,16 @@ try:
     saved_embed_colour_value = int(saved_embed_colour_raw, 16)
 except ValueError as exc:
     raise RuntimeError("Saved bot settings in SQLite are invalid.") from exc
+
+# Make the saved /settings values visible to the booster helper modules BEFORE they
+# are imported (some of them read these names from the process environment at import
+# time). This only touches the running process - nothing is written to .env.
+os.environ["BOOSTER_ROLE_ID"] = str(saved_booster_role_id)
+os.environ["STAFF_TEAM_ROLE_ID"] = str(saved_staff_team_role_id)
+os.environ["REVEAL_ARCHIVE_CHANNEL_ID"] = str(saved_reveal_archive_channel_id)
+
+# Imported after load_dotenv() (WATERMARK_SECRET) and after the settings above.
+from booster_commands import booster
 
 FORUM_CHANNEL_ID = saved_forum_id or FORUM_CHANNEL_ID
 forum_pacer.forum_channel_id = FORUM_CHANNEL_ID
