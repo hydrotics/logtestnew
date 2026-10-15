@@ -39,16 +39,27 @@ from settings import build_settings_command
 
 load_dotenv()
 
+# Imported after load_dotenv() so WATERMARK_SECRET is available to the module.
+import booster
+
+# Only these three values live in .env:
+#   DISCORD_TOKEN, WATERMARK_SECRET (read by booster.py), BOT_OWNER_ID
+# Everything else is configured through /settings and stored in SQLite.
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_PATH = os.getenv(
-    "DATABASE_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.sqlite3"),
+
+_default_data_dir = (
+    "/var/data"
+    if os.path.isdir("/var/data")
+    else os.path.dirname(os.path.abspath(__file__))
 )
+DATABASE_PATH = os.path.join(_default_data_dir, "bot_data.sqlite3")
+
+# First-run defaults; the real values are saved through /settings.
+FORUM_CHANNEL_ID = 0
+DISCORD_GUILD_ID = 0
+CREATE_CONCURRENCY = 1
 
 try:
-    FORUM_CHANNEL_ID = int(os.getenv("DISCORD_FORUM_CHANNEL_ID", "0"))
-    DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
-    CREATE_CONCURRENCY = int(os.getenv("CREATE_CONCURRENCY", "1"))
     owner_id_value = os.getenv("BOT_OWNER_ID", "").strip()
     if not owner_id_value:
         raise RuntimeError("BOT_OWNER_ID is missing from .env")
@@ -56,10 +67,7 @@ try:
     if BOT_OWNER_ID <= 0:
         raise ValueError("BOT_OWNER_ID must be a positive Discord user ID")
 except ValueError as exc:
-    raise RuntimeError(
-        "BOT_OWNER_ID, DISCORD_FORUM_CHANNEL_ID, DISCORD_GUILD_ID and "
-        "CREATE_CONCURRENCY must be valid values."
-    ) from exc
+    raise RuntimeError("BOT_OWNER_ID must be a valid Discord user ID.") from exc
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing from .env")
@@ -92,6 +100,11 @@ class LogCommandTree(app_commands.CommandTree):
                     "This bot is configured for a different server.",
                 )
                 return False
+
+        # Booster commands keep their own permission checks (booster role /
+        # staff team role), exactly as in the standalone booster bot.
+        if booster.is_booster_interaction(interaction):
+            return True
 
         if interaction.user.id == BOT_OWNER_ID:
             return True
@@ -159,6 +172,16 @@ class LogBot(discord.Client):
         except Exception:
             logger.exception("Keep-alive server failed to start")
 
+        # Persistent views + cleanup for the booster reveal system.
+        try:
+            await booster.setup_hook(self)
+        except Exception:
+            logger.exception("Booster reveal setup failed")
+
+        # Everything registered on the tree so far belongs to the booster module.
+        # Grab it before the command sync below clears the tree.
+        booster_commands = booster.collect_commands(self.tree)
+
         guild_id = log_manager.guild_id or DISCORD_GUILD_ID
         if not guild_id and log_manager.forum_channel_id:
             try:
@@ -183,14 +206,32 @@ class LogBot(discord.Client):
             apply_main_settings=apply_main_settings,
             apply_forum_settings=apply_forum_settings,
             apply_creation_settings=apply_creation_settings,
+            apply_booster_settings=apply_booster_settings,
+            get_booster_settings=get_booster_settings,
         )
-        current_commands = (
+        forum_commands = (
             build_create_log_commands(manager=log_manager, owner_id=BOT_OWNER_ID),
             build_status_command(manager=log_manager),
             creation_prompt_command,
             settings_command,
         )
-        expected_names = {"create_log", "creation_prompt", "settings", "status"}
+
+        # The forum bot's command names always win; a booster command that would
+        # collide with one of them is skipped (and logged) instead of silently
+        # replacing it.
+        forum_names = {command.name for command in forum_commands}
+        accepted_booster_commands = []
+        for command in booster_commands:
+            if command.name in forum_names:
+                logger.error(
+                    "Booster command %r conflicts with an existing command name and was not registered.",
+                    command.name,
+                )
+                continue
+            accepted_booster_commands.append(command)
+
+        current_commands = (*forum_commands, *accepted_booster_commands)
+        expected_names = {command.name for command in current_commands}
 
         last_error: Exception | None = None
         for attempt in range(1, 4):
@@ -310,6 +351,7 @@ class LogBot(discord.Client):
         )
 
     async def close(self) -> None:
+        booster.shutdown()
         await self.keepalive.stop()
         await super().close()
         database.close()
@@ -366,6 +408,11 @@ try:
     saved_creation_approve_channel_id = int(
         database.get_setting("creation_approve_channel_id") or "0"
     )
+    saved_booster_role_id = int(database.get_setting("booster_role_id") or "0")
+    saved_staff_team_role_id = int(database.get_setting("staff_team_role_id") or "0")
+    saved_reveal_archive_channel_id = int(
+        database.get_setting("reveal_archive_channel_id") or "0"
+    )
     saved_embed_colour_raw = database.get_setting("embed_colour") or "#242429"
     if saved_embed_colour_raw.startswith("#"):
         saved_embed_colour_raw = saved_embed_colour_raw[1:]
@@ -393,6 +440,15 @@ log_manager.embed_colour = discord.Colour(saved_embed_colour_value)
 log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
 log_manager.creation_prompt_channel_id = saved_creation_prompt_channel_id
 log_manager.creation_approve_channel_id = saved_creation_approve_channel_id
+
+# Booster reveal system (registers its commands on bot.tree; they are moved into
+# the guild-scoped registration by LogBot.setup_hook).
+booster.install(
+    bot,
+    booster_role_id=saved_booster_role_id,
+    staff_team_role_id=saved_staff_team_role_id,
+    reveal_archive_channel_id=saved_reveal_archive_channel_id,
+)
 
 
 def apply_main_settings(staff_role_id: int, embed_colour_value: int) -> None:
@@ -434,12 +490,39 @@ def apply_creation_settings(prompt_channel_id: int, approve_channel_id: int) -> 
     log_manager.creation_approve_channel_id = int(approve_channel_id)
 
 
+def get_booster_settings() -> tuple[int, int, int]:
+    return (
+        int(booster.BOOSTER_ROLE_ID),
+        int(booster.STAFF_TEAM_ROLE_ID),
+        int(booster.REVEAL_ARCHIVE_CHANNEL_ID),
+    )
+
+
+def apply_booster_settings(
+    booster_role_id: int,
+    staff_team_role_id: int,
+    reveal_archive_channel_id: int,
+) -> None:
+    database.set_setting("booster_role_id", str(int(booster_role_id)))
+    database.set_setting("staff_team_role_id", str(int(staff_team_role_id)))
+    database.set_setting(
+        "reveal_archive_channel_id", str(int(reveal_archive_channel_id))
+    )
+    booster.update_config(
+        booster_role_id=int(booster_role_id),
+        staff_team_role_id=int(staff_team_role_id),
+        reveal_archive_channel_id=int(reveal_archive_channel_id),
+    )
+
+
 @tree.error
 async def on_app_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ) -> None:
-    if isinstance(error, app_commands.MissingPermissions):
+    if booster.is_booster_interaction(interaction):
+        message = booster.command_error_message(error)
+    elif isinstance(error, app_commands.MissingPermissions):
         message = "You do not have permission to use this command."
     else:
         logger.error("Unhandled command error", exc_info=error)
@@ -515,6 +598,18 @@ async def on_ready() -> None:
         logger.info("Command registration is stable; no command resync on reconnect.")
         if log_manager.forum_channel_id:
             log_manager.schedule_auto_reconcile()
+
+    await booster.on_ready_hook()
+
+
+@bot.event
+async def on_disconnect() -> None:
+    booster.on_disconnect_hook()
+
+
+@bot.event
+async def on_resumed() -> None:
+    booster.on_resumed_hook()
 
 
 @bot.event
