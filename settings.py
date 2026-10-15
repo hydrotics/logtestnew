@@ -12,6 +12,8 @@ logger = logging.getLogger("discord-log-bot.settings")
 ApplyMainSettings = Callable[[int, int], None]
 ApplyForumSettings = Callable[[int, int, bool, int], None]
 ApplyCreationSettings = Callable[[int, int], None]
+ApplyBoosterSettings = Callable[[int, int, int], None]
+GetBoosterSettings = Callable[[], tuple[int, int, int]]
 DEFAULT_EMBED_COLOUR = 0x242429
 
 
@@ -22,6 +24,8 @@ def build_settings_command(
     apply_main_settings: ApplyMainSettings,
     apply_forum_settings: ApplyForumSettings,
     apply_creation_settings: ApplyCreationSettings,
+    apply_booster_settings: ApplyBoosterSettings,
+    get_booster_settings: GetBoosterSettings,
 ) -> app_commands.Command:
     async def reply(interaction: discord.Interaction, message: str) -> None:
         if interaction.response.is_done():
@@ -392,25 +396,148 @@ def build_settings_command(
             )
 
     class BoosterConfigModal(discord.ui.Modal, title="Booster Config"):
-        placeholder_field = discord.ui.Label(
-            text="Booster configuration",
-            description="This section is a placeholder for future settings.",
-            component=discord.ui.TextInput(
-                style=discord.TextStyle.short,
+        booster_role = discord.ui.Label(
+            text="Booster role",
+            description="Members with this role can view their booster reveal.",
+            component=discord.ui.RoleSelect(
+                placeholder="Select the booster role",
+                min_values=0,
+                max_values=1,
                 required=False,
-                max_length=100,
-                placeholder="No booster settings yet",
             ),
         )
+        staff_team_role = discord.ui.Label(
+            text="Staff team role",
+            description=(
+                "Members with this role can upload, trace and manage booster reveals."
+            ),
+            component=discord.ui.RoleSelect(
+                placeholder="Select the staff team role",
+                min_values=0,
+                max_values=1,
+                required=False,
+            ),
+        )
+        reveal_archive_channel = discord.ui.Label(
+            text="Reveal archive channel",
+            description="Text channel used to archive reveals so they survive restarts.",
+            component=discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Select the reveal archive channel",
+                min_values=0,
+                max_values=1,
+                required=False,
+            ),
+        )
+
+        def __init__(self) -> None:
+            super().__init__(timeout=300)
+            booster_role_id, staff_team_role_id, archive_channel_id = (
+                get_booster_settings()
+            )
+            self.booster_role.component.default_values = (
+                [discord.Object(id=booster_role_id)] if booster_role_id else []
+            )
+            self.staff_team_role.component.default_values = (
+                [discord.Object(id=staff_team_role_id)] if staff_team_role_id else []
+            )
+            self.reveal_archive_channel.component.default_values = (
+                [discord.Object(id=archive_channel_id)] if archive_channel_id else []
+            )
 
         async def on_submit(self, interaction: discord.Interaction) -> None:
             if interaction.user.id != owner_id:
                 await reply(interaction, "Only the configured bot owner can change settings.")
                 return
-            await reply(
-                interaction,
-                "Booster config is a placeholder for now. No settings were changed.",
+            guild = interaction.guild
+            if guild is None:
+                await reply(
+                    interaction,
+                    "Run this command inside the server you want to configure.",
+                )
+                return
+
+            booster_values = self.booster_role.component.values
+            booster_role_id = int(booster_values[0].id) if booster_values else 0
+            if booster_role_id == guild.id:
+                await reply(
+                    interaction,
+                    "The @everyone role cannot be used as the booster role. "
+                    "Choose a specific role.",
+                )
+                return
+            if booster_role_id and guild.get_role(booster_role_id) is None:
+                await reply(
+                    interaction,
+                    "The selected booster role could not be found in this server.",
+                )
+                return
+
+            staff_values = self.staff_team_role.component.values
+            staff_team_role_id = int(staff_values[0].id) if staff_values else 0
+            if staff_team_role_id == guild.id:
+                await reply(
+                    interaction,
+                    "The @everyone role cannot be used as the staff team role. "
+                    "Choose a specific role.",
+                )
+                return
+            if staff_team_role_id and guild.get_role(staff_team_role_id) is None:
+                await reply(
+                    interaction,
+                    "The selected staff team role could not be found in this server.",
+                )
+                return
+
+            archive_values = self.reveal_archive_channel.component.values
+            archive_channel_id = int(archive_values[0].id) if archive_values else 0
+            if archive_channel_id:
+                archive = guild.get_channel(archive_channel_id)
+                if not isinstance(archive, discord.TextChannel):
+                    await reply(
+                        interaction,
+                        "The reveal archive channel must be a text channel in this server.",
+                    )
+                    return
+
+            previous_booster_role_id, previous_staff_team_role_id, previous_archive_channel_id = (
+                get_booster_settings()
             )
+
+            try:
+                apply_booster_settings(
+                    booster_role_id,
+                    staff_team_role_id,
+                    archive_channel_id,
+                )
+            except Exception:
+                logger.exception("Could not save booster settings")
+                await reply(
+                    interaction,
+                    "I could not save the booster settings. Check the bot logs and try again.",
+                )
+                return
+
+            booster_text = f"<@&{booster_role_id}>" if booster_role_id else "not set"
+            staff_text = (
+                f"<@&{staff_team_role_id}>" if staff_team_role_id else "not set"
+            )
+            archive_text = f"<#{archive_channel_id}>" if archive_channel_id else "not set"
+            message = (
+                "**Booster settings saved.**\n"
+                f"Booster role: {booster_text}\n"
+                f"Staff team role: {staff_text}\n"
+                f"Reveal archive channel: {archive_text}"
+            )
+            if (
+                staff_team_role_id != previous_staff_team_role_id
+                or archive_channel_id != previous_archive_channel_id
+            ):
+                message += (
+                    "\nRestart the bot to apply the staff team role and reveal archive "
+                    "channel to the reveal history and stress-test tools."
+                )
+            await reply(interaction, message)
 
     class SettingsMenuView(discord.ui.View):
         def __init__(self) -> None:
