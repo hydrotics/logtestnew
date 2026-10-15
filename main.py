@@ -40,7 +40,7 @@ from settings import build_settings_command
 load_dotenv()
 
 # Only these three values live in .env:
-#   DISCORD_TOKEN, WATERMARK_SECRET (read by booster.py), BOT_OWNER_ID
+#   DISCORD_TOKEN, WATERMARK_SECRET (read by booster_reveal.py), BOT_OWNER_ID
 # Everything else is configured through /settings and stored in SQLite.
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -430,7 +430,7 @@ os.environ["STAFF_TEAM_ROLE_ID"] = str(saved_staff_team_role_id)
 os.environ["REVEAL_ARCHIVE_CHANNEL_ID"] = str(saved_reveal_archive_channel_id)
 
 # Imported after load_dotenv() (WATERMARK_SECRET) and after the settings above.
-from booster_commands import booster
+from booster_commands import booster_reveal as booster
 
 FORUM_CHANNEL_ID = saved_forum_id or FORUM_CHANNEL_ID
 forum_pacer.forum_channel_id = FORUM_CHANNEL_ID
