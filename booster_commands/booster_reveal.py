@@ -66,6 +66,8 @@ WM_KEY = SECRET.encode("utf-8")
 BOOSTER_ROLE_ID = 0
 STAFF_TEAM_ROLE_ID = 0
 REVEAL_ARCHIVE_CHANNEL_ID = 0
+# The bot owner may run every booster command regardless of roles. Set by install().
+BOT_OWNER_ID = 0
 
 
 def update_config(
@@ -96,7 +98,12 @@ def update_config(
         and (STAFF_TEAM_ROLE_ID, REVEAL_ARCHIVE_CHANNEL_ID) != previous
     ):
         HISTORY._swap(
-            RevealHistoryStore(bot, REVEAL_ARCHIVE_CHANNEL_ID, STAFF_TEAM_ROLE_ID)
+            RevealHistoryStore(
+                bot,
+                REVEAL_ARCHIVE_CHANNEL_ID,
+                STAFF_TEAM_ROLE_ID,
+                owner_id=BOT_OWNER_ID,
+            )
         )
         _schedule_rehydrate()
 
@@ -628,12 +635,34 @@ def member_is_booster(member: discord.Member) -> bool:
     return member_has_role(member, BOOSTER_ROLE_ID)
 
 
+def is_owner(user) -> bool:
+    """True for the configured bot owner, who may run every booster command."""
+    return bool(BOT_OWNER_ID) and getattr(user, "id", 0) == BOT_OWNER_ID
+
+
 def is_booster(interaction: discord.Interaction) -> bool:
-    return isinstance(interaction.user, discord.Member) and member_is_booster(interaction.user)
+    return is_owner(interaction.user) or (
+        isinstance(interaction.user, discord.Member) and member_is_booster(interaction.user)
+    )
+
+
+def can_view_reveal(interaction: discord.Interaction) -> bool:
+    """Allow the bot owner, current boosters, and the configured booster staff role to view reveals."""
+    user = interaction.user
+    if is_owner(user):
+        return True
+    if not isinstance(user, discord.Member):
+        return False
+    return member_is_booster(user) or (
+        bool(STAFF_TEAM_ROLE_ID) and member_has_role(user, STAFF_TEAM_ROLE_ID)
+    )
 
 
 def is_staff(interaction: discord.Interaction) -> bool:
-    return isinstance(interaction.user, discord.Member) and member_has_role(interaction.user, STAFF_TEAM_ROLE_ID)
+    return is_owner(interaction.user) or (
+        isinstance(interaction.user, discord.Member)
+        and member_has_role(interaction.user, STAFF_TEAM_ROLE_ID)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +855,7 @@ async def download_media_url(url: str, limit: int = MAX_URL_BYTES) -> tuple[Path
                         size = 0
                     if size > limit:
                         raise RevealRejected(
-                            f"That URL points to {size / 1048576:.1f} MB; the limit is {limit / 1048576:.1f} MB."
+                            f"That URL points to {size / 1048576:.1f} MB; the limit is {limit / 1048576:.0f} MB."
                         )
 
                     ext = Path(parsed.path).suffix.lower()
@@ -1243,9 +1272,11 @@ async def send_personalized_reveal(interaction: discord.Interaction) -> None:
     if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("I couldn't verify your server membership.", ephemeral=True)
         return
-    if not member_is_booster(interaction.user):
+    # Keep this shared check in sync with the /view_reveal decorator so staff can
+    # use both the slash command and the persistent View Reveal button.
+    if not can_view_reveal(interaction):
         await interaction.response.send_message(
-            "❌ This reveal is available to current server boosters only.", ephemeral=True
+            "❌ This reveal is available to current server boosters and booster staff only.", ephemeral=True
         )
         return
 
@@ -1555,7 +1586,7 @@ async def upload(
 
 @app_commands.command(name="view_reveal", description="Get your booster reveal.")
 @app_commands.guild_only()
-@app_commands.check(is_booster)
+@app_commands.check(can_view_reveal)
 async def view_reveal(interaction: discord.Interaction):
     await send_personalized_reveal(interaction)
 
@@ -1803,14 +1834,24 @@ def install(
     booster_role_id: int,
     staff_team_role_id: int,
     reveal_archive_channel_id: int,
+    owner_id: int = 0,
 ) -> None:
     """Create the history store, register every booster command on the shared tree
     and install the stress-test tooling. Call once, after the client exists."""
-    global bot, HISTORY
+    global bot, HISTORY, BOT_OWNER_ID
+    try:
+        BOT_OWNER_ID = int(owner_id or os.getenv("BOT_OWNER_ID", "").strip() or 0)
+    except ValueError:
+        BOT_OWNER_ID = 0
     update_config(booster_role_id, staff_team_role_id, reveal_archive_channel_id)
     bot = client
     HISTORY = _HistoryProxy(
-        RevealHistoryStore(client, REVEAL_ARCHIVE_CHANNEL_ID, STAFF_TEAM_ROLE_ID)
+        RevealHistoryStore(
+            client,
+            REVEAL_ARCHIVE_CHANNEL_ID,
+            STAFF_TEAM_ROLE_ID,
+            owner_id=BOT_OWNER_ID,
+        )
     )
 
     if inspect.iscoroutinefunction(HISTORY.record_stress_test_users):
@@ -1831,7 +1872,8 @@ def install(
             HISTORY,
             cleanup_callback=cleanup_deleted_reveal,
             before_delete_callback=before_delete_reveal,
-            staff_role_id=STAFF_TEAM_ROLE_ID,
+            staff_role_id=lambda: STAFF_TEAM_ROLE_ID,
+            owner_id=BOT_OWNER_ID,
         )
     )
 
@@ -1859,7 +1901,7 @@ def install(
 async def setup_hook(client: discord.Client) -> None:
     await asyncio.to_thread(startup_cleanup)
     client.add_view(RevealButtonView())
-    client.add_view(ArchiveServedUsersView(HISTORY, STAFF_TEAM_ROLE_ID))
+    client.add_view(ArchiveServedUsersView(HISTORY, lambda: STAFF_TEAM_ROLE_ID, BOT_OWNER_ID))
 
 
 def collect_commands(tree: app_commands.CommandTree) -> list:
