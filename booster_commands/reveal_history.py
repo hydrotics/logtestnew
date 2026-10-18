@@ -27,6 +27,22 @@ DOWNLOAD_CHUNK = 1 << 20
 DEFAULT_DOWNLOAD_LIMIT = 250 * 1048576
 
 
+def _staff_ok(user, staff_role_id, owner_id) -> bool:
+    """True for the bot owner, or for a member holding the staff team role.
+
+    `staff_role_id` may be an int or a zero-argument callable returning an int, so
+    a role saved through /settings is picked up live without a restart.
+    """
+    if owner_id and getattr(user, "id", 0) == int(owner_id):
+        return True
+    role_id = int((staff_role_id() if callable(staff_role_id) else staff_role_id) or 0)
+    return (
+        isinstance(user, discord.Member)
+        and role_id != 0
+        and any(role.id == role_id for role in user.roles)
+    )
+
+
 class RevealHistoryError(RuntimeError):
     pass
 
@@ -42,10 +58,17 @@ class RevealHistoryStore:
     Keep this channel private to staff and the bot.
     """
 
-    def __init__(self, bot: discord.Client, archive_channel_id: int = 0, staff_role_id: int = 0) -> None:
+    def __init__(
+        self,
+        bot: discord.Client,
+        archive_channel_id: int = 0,
+        staff_role_id: int = 0,
+        owner_id: int = 0,
+    ) -> None:
         self.bot = bot
         self.archive_channel_id = int(archive_channel_id or 0)
         self.staff_role_id = int(staff_role_id or 0)
+        self.owner_id = int(owner_id or 0)
         self._edit_lock = asyncio.Lock()
         self._cache: dict[str, dict] = {}
         self._loaded = False
@@ -161,7 +184,9 @@ class RevealHistoryStore:
         return users, labels
 
     def _served_view(self) -> "ArchiveServedUsersView":
-        return ArchiveServedUsersView(self, self.staff_role_id)
+        # The staff role is read live and the owner always passes, so the button
+        # works for both even if the role is changed in /settings while running.
+        return ArchiveServedUsersView(self, lambda: self.staff_role_id, self.owner_id)
 
     def _embed_for(self, record: dict) -> discord.Embed:
         kind = record["kind"]
@@ -227,8 +252,6 @@ class RevealHistoryStore:
                     try:
                         served.add(int(item))
                     except ValueError:
-                                                                               
-                                                                                             
                         if item.lower().startswith("test"):
                             stress_test_users.add(item)
         profiles: set[tuple[int, float]] = set()
@@ -348,8 +371,6 @@ class RevealHistoryStore:
                 "archive_filename": message.attachments[0].filename if message.attachments else source.name,
             }
         )
-                                                                                             
-                                                                                                        
         self._cache[record["reveal_id"]] = record
         self._loaded = True
         return record
@@ -494,10 +515,12 @@ class RevealHistoryStore:
 
 
 class ArchiveServedUsersView(discord.ui.View):
-    def __init__(self, store: RevealHistoryStore, staff_role_id: int) -> None:
+    def __init__(self, store: RevealHistoryStore, staff_role_id, owner_id: int = 0) -> None:
         super().__init__(timeout=None)
         self.store = store
-        self.staff_role_id = int(staff_role_id)
+        # int or zero-argument callable (read live on every click).
+        self.staff_role_id = staff_role_id
+        self.owner_id = int(owner_id or 0)
         button = discord.ui.Button(
             label="View served users",
             style=discord.ButtonStyle.secondary,
@@ -507,8 +530,7 @@ class ArchiveServedUsersView(discord.ui.View):
         self.add_item(button)
 
     async def _callback(self, interaction: discord.Interaction) -> None:
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if member is None or not any(role.id == self.staff_role_id for role in member.roles):
+        if not _staff_ok(interaction.user, self.staff_role_id, self.owner_id):
             await interaction.response.send_message("You don't have permission to use this button.", ephemeral=True)
             return
         record = await self.store.by_archive_message_id(interaction.message.id if interaction.message else 0)
@@ -545,7 +567,8 @@ def make_history_command(
     store: RevealHistoryStore,
     cleanup_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     before_delete_callback: Optional[Callable[[str], Awaitable[None]]] = None,
-    staff_role_id: int = 0,
+    staff_role_id=0,
+    owner_id: int = 0,
 ) -> app_commands.Command:
     class HistoryView(discord.ui.View):
         def __init__(self, owner_id: int, rows: list[dict], page: int = 0) -> None:
@@ -585,8 +608,7 @@ def make_history_command(
 
         def _make_delete_callback(self, reveal_id: str):
             async def callback(interaction: discord.Interaction) -> None:
-                member = interaction.user if isinstance(interaction.user, discord.Member) else None
-                if member is None or not any(role.id == int(staff_role_id) for role in member.roles):
+                if not _staff_ok(interaction.user, staff_role_id, owner_id):
                     await interaction.response.send_message("You don't have permission to use these buttons.", ephemeral=True)
                     return
                 await interaction.response.defer(ephemeral=True)
@@ -609,16 +631,14 @@ def make_history_command(
             return callback
 
         async def _previous(self, interaction: discord.Interaction) -> None:
-            member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if member is None or not any(role.id == int(staff_role_id) for role in member.roles):
+            if not _staff_ok(interaction.user, staff_role_id, owner_id):
                 await interaction.response.send_message("You don't have permission to use these buttons.", ephemeral=True)
                 return
             self.page = max(0, self.page - 1)
             await interaction.response.edit_message(embed=_history_embed(self.rows, self.page), view=HistoryView(self.owner_id, self.rows, self.page))
 
         async def _next(self, interaction: discord.Interaction) -> None:
-            member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if member is None or not any(role.id == int(staff_role_id) for role in member.roles):
+            if not _staff_ok(interaction.user, staff_role_id, owner_id):
                 await interaction.response.send_message("You don't have permission to use these buttons.", ephemeral=True)
                 return
             total_pages = max(1, (len(self.rows) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -644,7 +664,7 @@ def make_history_command(
 
     @app_commands.command(name="reveal_history", description="Staff: show and delete archived past reveals.")
     @app_commands.guild_only()
-    @app_commands.check(lambda interaction: isinstance(interaction.user, discord.Member) and any(role.id == int(staff_role_id) for role in interaction.user.roles))
+    @app_commands.check(lambda interaction: _staff_ok(interaction.user, staff_role_id, owner_id))
     async def reveal_history(interaction: discord.Interaction) -> None:
         rows = await store.records(force_refresh=True)
         await interaction.response.send_message(
