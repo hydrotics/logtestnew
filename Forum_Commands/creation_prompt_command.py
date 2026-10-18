@@ -616,8 +616,6 @@ def setup_creation_prompt(
         client.add_view(PromptView())
         client.add_dynamic_items(ReviewSelect)
 
-        # LogBot inherits directly from discord.Client, which has no commands.Bot
-        # listener API. Wrap on_message while preserving any existing handler.
         original_on_message = getattr(client, "on_message", None)
 
         async def combined_on_message(
