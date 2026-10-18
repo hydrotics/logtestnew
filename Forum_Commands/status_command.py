@@ -76,12 +76,24 @@ class StatusTracker:
         )
 
 
-def build_status_command(*, manager: Any) -> app_commands.Command:
+def build_status_command(*, manager: Any, owner_id: int = 0) -> app_commands.Command:
+    def can_manage_forum(user: Any) -> bool:
+        """Owner, or a member holding the forum manager role (read live)."""
+        if owner_id and getattr(user, "id", 0) == owner_id:
+            return True
+        role_id = int(getattr(manager, "forum_manager_role_id", 0) or 0)
+        return (
+            bool(role_id)
+            and isinstance(user, discord.Member)
+            and any(role.id == role_id for role in user.roles)
+        )
+
     @app_commands.command(
         name="status",
         description="Show the current logging progress.",
     )
     @app_commands.guild_only()
+    @app_commands.check(lambda interaction: can_manage_forum(interaction.user))
     async def status(interaction: discord.Interaction) -> None:
         initial_embed = build_status_embed(manager.job)
         configured_colour = getattr(manager, "embed_colour", None)
