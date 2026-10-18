@@ -10,7 +10,7 @@ from discord import app_commands
 logger = logging.getLogger("discord-log-bot.settings")
 
 ApplyMainSettings = Callable[[int, int], None]
-ApplyForumSettings = Callable[[int, int, bool, int], None]
+ApplyForumSettings = Callable[[int, int, bool, int, int], None]
 ApplyCreationSettings = Callable[[int, int], None]
 ApplyBoosterSettings = Callable[[int, int, int], None]
 GetBoosterSettings = Callable[[], tuple[int, int, int]]
@@ -33,9 +33,48 @@ def build_settings_command(
         else:
             await interaction.response.send_message(message, ephemeral=True)
 
-    async def validate_submit_context(interaction: discord.Interaction) -> bool:
-        if interaction.user.id != owner_id:
-            await reply(interaction, "Only the configured bot owner can change settings.")
+    def _has_role(user: Any, role_id: int) -> bool:
+        return (
+            bool(role_id)
+            and isinstance(user, discord.Member)
+            and any(role.id == role_id for role in user.roles)
+        )
+
+    def is_main_staff(user: Any) -> bool:
+        return _has_role(user, int(getattr(manager, "staff_role_id", 0) or 0))
+
+    def is_booster_staff(user: Any) -> bool:
+        return _has_role(user, int(get_booster_settings()[1] or 0))
+
+    def is_forum_manager(user: Any) -> bool:
+        return _has_role(user, int(getattr(manager, "forum_manager_role_id", 0) or 0))
+
+    def can_use_general_settings(user: Any) -> bool:
+        """Main config + Creation approval: owner, main staff or booster staff."""
+        return (
+            user.id == owner_id or is_main_staff(user) or is_booster_staff(user)
+        )
+
+    def can_use_forum_config(user: Any) -> bool:
+        """Forum config: owner, forum manager role or booster staff."""
+        return (
+            user.id == owner_id or is_forum_manager(user) or is_booster_staff(user)
+        )
+
+    def can_use_settings(user: Any) -> bool:
+        """/settings itself: anyone who may open at least one section."""
+        return can_use_general_settings(user) or can_use_forum_config(user)
+
+    def can_use_booster_config(user: Any) -> bool:
+        """Only the owner or the booster staff role may open Booster config."""
+        return user.id == owner_id or is_booster_staff(user)
+
+    async def validate_submit_context(
+        interaction: discord.Interaction,
+        allowed: Callable[[Any], bool] | None = None,
+    ) -> bool:
+        if not (allowed or can_use_general_settings)(interaction.user):
+            await reply(interaction, "You don't have permission to change settings.")
             return False
         if interaction.guild is None:
             await reply(
@@ -56,8 +95,7 @@ def build_settings_command(
         staff_role = discord.ui.Label(
             text="Staff role",
             description=(
-                "Members with this role can use bot commands. "
-                "Leave blank for owner-only access."
+                "Can run all commands except booster commands. Blank = owner only."
             ),
             component=discord.ui.RoleSelect(
                 placeholder="Select a staff role (optional)",
@@ -196,6 +234,17 @@ def build_settings_command(
             ),
         )
 
+        forum_manager_role = discord.ui.Label(
+            text="Forum manager role",
+            description="Can use forum commands and this section. Blank = owner only.",
+            component=discord.ui.RoleSelect(
+                placeholder="Select the forum manager role (optional)",
+                min_values=0,
+                max_values=1,
+                required=False,
+            ),
+        )
+
         def __init__(self) -> None:
             super().__init__(timeout=300)
             self.forum_channel.component.default_values = (
@@ -205,6 +254,10 @@ def build_settings_command(
             )
             self.target_role.component.default_values = (
                 [discord.Object(id=manager.role_id)] if manager.role_id else []
+            )
+            _fm_id = int(getattr(manager, "forum_manager_role_id", 0) or 0)
+            self.forum_manager_role.component.default_values = (
+                [discord.Object(id=_fm_id)] if _fm_id else []
             )
             self.auto_create.component.options = [
                 discord.SelectOption(
@@ -222,7 +275,7 @@ def build_settings_command(
             ]
 
         async def on_submit(self, interaction: discord.Interaction) -> None:
-            if not await validate_submit_context(interaction):
+            if not await validate_submit_context(interaction, can_use_forum_config):
                 return
             guild = interaction.guild
             assert guild is not None
@@ -266,6 +319,22 @@ def build_settings_command(
                 )
                 return
 
+            manager_values = self.forum_manager_role.component.values
+            forum_manager_role_id = int(manager_values[0].id) if manager_values else 0
+            if forum_manager_role_id == guild.id:
+                await reply(
+                    interaction,
+                    "The @everyone role cannot be used as the forum manager role. "
+                    "Choose a specific role or leave it blank for owner-only access.",
+                )
+                return
+            if forum_manager_role_id and guild.get_role(forum_manager_role_id) is None:
+                await reply(
+                    interaction,
+                    "The selected forum manager role could not be found in this server.",
+                )
+                return
+
             auto_values = self.auto_create.component.values
             if not auto_values or auto_values[0] not in {"true", "false"}:
                 await reply(interaction, "Choose True or False for automatic log creation.")
@@ -284,6 +353,7 @@ def build_settings_command(
                     target_role_id,
                     auto_create_enabled,
                     guild.id,
+                    forum_manager_role_id,
                 )
             except Exception:
                 logger.exception("Could not save forum settings")
@@ -294,12 +364,18 @@ def build_settings_command(
                 return
 
             target_text = f"<@&{target_role_id}>" if target_role_id else "not set"
+            manager_text = (
+                f"<@&{forum_manager_role_id}>"
+                if forum_manager_role_id
+                else "not set (owner-only access)"
+            )
             await reply(
                 interaction,
                 "**Forum settings saved.**\n"
                 f"Forum channel: {forum.mention}\n"
                 f"Member role to create logs for: {target_text}\n"
-                f"Auto create logs: **{auto_create_enabled}**",
+                f"Auto create logs: **{auto_create_enabled}**\n"
+                f"Forum manager role: {manager_text}",
             )
 
     class CreationApprovalModal(discord.ui.Modal, title="Creation Approval"):
@@ -446,8 +522,11 @@ def build_settings_command(
             )
 
         async def on_submit(self, interaction: discord.Interaction) -> None:
-            if interaction.user.id != owner_id:
-                await reply(interaction, "Only the configured bot owner can change settings.")
+            if not can_use_booster_config(interaction.user):
+                await reply(
+                    interaction,
+                    "Only the booster staff team role can change booster settings.",
+                )
                 return
             guild = interaction.guild
             if guild is None:
@@ -540,9 +619,25 @@ def build_settings_command(
         def __init__(self) -> None:
             super().__init__(timeout=300)
 
-        async def _owner_only(self, interaction: discord.Interaction) -> bool:
-            if interaction.user.id != owner_id:
-                await reply(interaction, "Only the configured bot owner can use these settings.")
+        async def _owner_only(
+            self, interaction: discord.Interaction, section: str = "general"
+        ) -> bool:
+            if section == "booster":
+                if not can_use_booster_config(interaction.user):
+                    await reply(
+                        interaction,
+                        "Only the booster staff team role can use booster settings.",
+                    )
+                    return False
+            elif section == "forum":
+                if not can_use_forum_config(interaction.user):
+                    await reply(
+                        interaction,
+                        "You need the forum manager role to use forum settings.",
+                    )
+                    return False
+            elif not can_use_general_settings(interaction.user):
+                await reply(interaction, "You don't have permission to use these settings.")
                 return False
             if interaction.guild is None:
                 await reply(interaction, "Use these settings inside the configured server.")
@@ -572,7 +667,7 @@ def build_settings_command(
             interaction: discord.Interaction,
             button: discord.ui.Button,
         ) -> None:
-            if await self._owner_only(interaction):
+            if await self._owner_only(interaction, section="forum"):
                 await interaction.response.send_modal(ForumConfigModal())
 
         @discord.ui.button(
@@ -585,7 +680,7 @@ def build_settings_command(
             interaction: discord.Interaction,
             button: discord.ui.Button,
         ) -> None:
-            if await self._owner_only(interaction):
+            if await self._owner_only(interaction, section="booster"):
                 await interaction.response.send_modal(BoosterConfigModal())
 
         @discord.ui.button(
@@ -603,13 +698,13 @@ def build_settings_command(
 
     @app_commands.command(
         name="settings",
-        description="Configure bot logging, roles, embed colour, and creation channels (owner only).",
+        description="Configure bot logging, roles, embed colour, and creation channels (staff only).",
     )
     @app_commands.guild_only()
     async def settings(interaction: discord.Interaction) -> None:
-        if interaction.user.id != owner_id:
+        if not can_use_settings(interaction.user):
             await interaction.response.send_message(
-                "Only the configured bot owner can use `/settings`.",
+                "You don't have permission to use `/settings`.",
                 ephemeral=True,
             )
             return
