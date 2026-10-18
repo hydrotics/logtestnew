@@ -17,6 +17,17 @@ def build_create_log_commands(
     manager: Any,
     owner_id: int,
 ) -> app_commands.Command:
+    def can_manage_forum(user: Any) -> bool:
+        """Owner, or a member holding the forum manager role (read live)."""
+        if getattr(user, "id", 0) == owner_id:
+            return True
+        role_id = int(getattr(manager, "forum_manager_role_id", 0) or 0)
+        return (
+            bool(role_id)
+            and isinstance(user, discord.Member)
+            and any(role.id == role_id for role in user.roles)
+        )
+
     class ConfirmCreateLogView(discord.ui.View):
         def __init__(
             self,
@@ -54,21 +65,12 @@ def build_create_log_commands(
                 )
                 return
 
-            if interaction.user.id != owner_id:
-                current_staff_role_id = getattr(manager, "staff_role_id", 0)
-                current_member = (
-                    interaction.user
-                    if isinstance(interaction.user, discord.Member)
-                    else None
+            if not can_manage_forum(interaction.user):
+                await interaction.response.send_message(
+                    "You need the forum manager role to confirm this action.",
+                    ephemeral=True,
                 )
-                if not current_staff_role_id or current_member is None or not any(
-                    role.id == current_staff_role_id for role in current_member.roles
-                ):
-                    await interaction.response.send_message(
-                        "You need the configured staff role to confirm this action.",
-                        ephemeral=True,
-                    )
-                    return
+                return
 
             if self.confirmed:
                 return
@@ -118,6 +120,7 @@ def build_create_log_commands(
         description="Create a forum post for every member with the configured role.",
     )
     @app_commands.guild_only()
+    @app_commands.check(lambda interaction: can_manage_forum(interaction.user))
     async def create_log(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
 
