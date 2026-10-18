@@ -79,6 +79,10 @@ intents = discord.Intents.default()
 intents.members = True
 
 
+# Commands that need the forum manager role (or the owner).
+FORUM_MANAGER_COMMANDS = {"create_log", "status"}
+
+
 class LogCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         manager = globals().get("log_manager")
@@ -98,8 +102,39 @@ class LogCommandTree(app_commands.CommandTree):
                 )
                 return False
 
+        member_roles = (
+            {role.id for role in interaction.user.roles}
+            if isinstance(interaction.user, discord.Member)
+            else set()
+        )
+        forum_manager_id = int(getattr(manager, "forum_manager_role_id", 0) or 0)
+
+        # Forum commands need the forum manager role (or the owner); the main
+        # staff role alone is not enough.
+        if command_name in FORUM_MANAGER_COMMANDS:
+            if interaction.user.id == BOT_OWNER_ID:
+                return True
+            if forum_manager_id and forum_manager_id in member_roles:
+                return True
+            await self._deny(
+                interaction,
+                "You need the forum manager role to use this command.",
+            )
+            return False
+
+        # /settings is also open to the booster staff team role and the forum
+        # manager role (the main staff role is handled by the normal staff check
+        # below). Which sections each role may open is enforced inside the
+        # /settings menu itself.
+        if command_name == "settings":
+            booster_staff_id = int(getattr(booster, "STAFF_TEAM_ROLE_ID", 0) or 0)
+            if (booster_staff_id and booster_staff_id in member_roles) or (
+                forum_manager_id and forum_manager_id in member_roles
+            ):
+                return True
+
         # Booster commands keep their own permission checks (booster role /
-        # staff team role), exactly as in the standalone booster bot.
+        # staff team role / bot owner), exactly as in the standalone booster bot.
         if booster.is_booster_interaction(interaction):
             return True
 
@@ -208,7 +243,7 @@ class LogBot(discord.Client):
         )
         forum_commands = (
             build_create_log_commands(manager=log_manager, owner_id=BOT_OWNER_ID),
-            build_status_command(manager=log_manager),
+            build_status_command(manager=log_manager, owner_id=BOT_OWNER_ID),
             creation_prompt_command,
             settings_command,
         )
@@ -397,6 +432,9 @@ logger.info("Using SQLite database at %s", os.path.abspath(DATABASE_PATH))
 try:
     saved_forum_id = int(database.get_setting("forum_channel_id") or "0")
     saved_staff_role_id = int(database.get_setting("staff_role_id") or "0")
+    saved_forum_manager_role_id = int(
+        database.get_setting("forum_manager_role_id") or "0"
+    )
     saved_target_role_id = int(database.get_setting("target_role_id") or "0")
     saved_guild_id = int(database.get_setting("guild_id") or "0")
     saved_creation_prompt_channel_id = int(
@@ -443,6 +481,7 @@ log_manager = LogManager(
     concurrency=CREATE_CONCURRENCY,
 )
 log_manager.staff_role_id = saved_staff_role_id
+log_manager.forum_manager_role_id = saved_forum_manager_role_id
 log_manager.embed_colour = discord.Colour(saved_embed_colour_value)
 log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
 log_manager.creation_prompt_channel_id = saved_creation_prompt_channel_id
@@ -455,6 +494,7 @@ booster.install(
     booster_role_id=saved_booster_role_id,
     staff_team_role_id=saved_staff_team_role_id,
     reveal_archive_channel_id=saved_reveal_archive_channel_id,
+    owner_id=BOT_OWNER_ID,
 )
 
 
@@ -475,7 +515,10 @@ def apply_forum_settings(
     target_role_id: int,
     auto_create_enabled: bool,
     guild_id: int,
+    forum_manager_role_id: int = 0,
 ) -> None:
+    database.set_setting("forum_manager_role_id", str(int(forum_manager_role_id)))
+    log_manager.forum_manager_role_id = int(forum_manager_role_id)
     database.set_setting("forum_channel_id", str(int(forum_channel_id)))
     database.set_setting("target_role_id", str(int(target_role_id)))
     database.set_setting("guild_id", str(int(guild_id)))
@@ -529,7 +572,7 @@ async def on_app_command_error(
 ) -> None:
     if booster.is_booster_interaction(interaction):
         message = booster.command_error_message(error)
-    elif isinstance(error, app_commands.MissingPermissions):
+    elif isinstance(error, app_commands.CheckFailure):
         message = "You do not have permission to use this command."
     else:
         logger.error("Unhandled command error", exc_info=error)
