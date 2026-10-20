@@ -16,8 +16,6 @@ import create_log as create_log_module
 from create_log import Database, ForumCreatePacer, LogManager
 from render import KeepAliveServer
 
-# Keep all status/progress embeds on the configurable global embed colour,
-# including embeds created by the logging engine's monitor_job_message helper.
 _original_build_status_embed = create_log_module.build_status_embed
 
 
@@ -34,14 +32,12 @@ create_log_module.build_status_embed = _build_status_embed_with_global_colour
 
 from Forum_Commands.create_log_command import build_create_log_commands
 from Forum_Commands.creation_prompt_command import setup_creation_prompt
+from Forum_Commands.member_scan_command import build_member_scan_command
 from Forum_Commands.status_command import build_status_command
-from settings import build_settings_command
+from settings import DEFAULT_SCAN_REASON, build_settings_command
 
 load_dotenv()
 
-# Only these three values live in .env:
-#   DISCORD_TOKEN, WATERMARK_SECRET (read by booster_reveal.py), BOT_OWNER_ID
-# Everything else is configured through /settings and stored in SQLite.
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 _default_data_dir = (
@@ -51,7 +47,6 @@ _default_data_dir = (
 )
 DATABASE_PATH = os.path.join(_default_data_dir, "bot_data.sqlite3")
 
-# First-run defaults; the real values are saved through /settings.
 FORUM_CHANNEL_ID = 0
 DISCORD_GUILD_ID = 0
 CREATE_CONCURRENCY = 1
@@ -79,7 +74,6 @@ intents = discord.Intents.default()
 intents.members = True
 
 
-# Commands that need the forum manager role (or the owner).
 FORUM_MANAGER_COMMANDS = {"create_log", "status"}
 
 
@@ -109,8 +103,6 @@ class LogCommandTree(app_commands.CommandTree):
         )
         forum_manager_id = int(getattr(manager, "forum_manager_role_id", 0) or 0)
 
-        # Forum commands need the forum manager role (or the owner); the main
-        # staff role alone is not enough.
         if command_name in FORUM_MANAGER_COMMANDS:
             if interaction.user.id == BOT_OWNER_ID:
                 return True
@@ -122,10 +114,6 @@ class LogCommandTree(app_commands.CommandTree):
             )
             return False
 
-        # /settings is also open to the booster staff team role and the forum
-        # manager role (the main staff role is handled by the normal staff check
-        # below). Which sections each role may open is enforced inside the
-        # /settings menu itself.
         if command_name == "settings":
             booster_staff_id = int(getattr(booster, "STAFF_TEAM_ROLE_ID", 0) or 0)
             if (booster_staff_id and booster_staff_id in member_roles) or (
@@ -133,8 +121,6 @@ class LogCommandTree(app_commands.CommandTree):
             ):
                 return True
 
-        # Booster commands keep their own permission checks (booster role /
-        # staff team role / bot owner), exactly as in the standalone booster bot.
         if booster.is_booster_interaction(interaction):
             return True
 
@@ -204,14 +190,11 @@ class LogBot(discord.Client):
         except Exception:
             logger.exception("Keep-alive server failed to start")
 
-        # Persistent views + cleanup for the booster reveal system.
         try:
             await booster.setup_hook(self)
         except Exception:
             logger.exception("Booster reveal setup failed")
 
-        # Everything registered on the tree so far belongs to the booster module.
-        # Grab it before the command sync below clears the tree.
         booster_commands = booster.collect_commands(self.tree)
 
         guild_id = log_manager.guild_id or DISCORD_GUILD_ID
@@ -240,17 +223,21 @@ class LogBot(discord.Client):
             apply_creation_settings=apply_creation_settings,
             apply_booster_settings=apply_booster_settings,
             get_booster_settings=get_booster_settings,
+            apply_scan_settings=apply_scan_settings,
+            get_scan_settings=get_scan_settings,
         )
         forum_commands = (
             build_create_log_commands(manager=log_manager, owner_id=BOT_OWNER_ID),
             build_status_command(manager=log_manager, owner_id=BOT_OWNER_ID),
+            build_member_scan_command(
+                manager=log_manager,
+                owner_id=BOT_OWNER_ID,
+                get_scan_settings=get_scan_settings,
+            ),
             creation_prompt_command,
             settings_command,
         )
 
-        # The forum bot's command names always win; a booster command that would
-        # collide with one of them is skipped (and logged) instead of silently
-        # replacing it.
         forum_names = {command.name for command in forum_commands}
         accepted_booster_commands = []
         for command in booster_commands:
@@ -272,9 +259,6 @@ class LogBot(discord.Client):
                     database.get_setting("command_sync_guild_id") or "0"
                 )
 
-                # Discover every guild this application is installed in. This lets
-                # us remove old guild-scoped commands from stale/test servers too,
-                # not just from the last guild this particular database remembers.
                 guild_scope_ids: set[int] = set()
                 try:
                     async for installed_guild in self.fetch_guilds(limit=None):
@@ -290,8 +274,6 @@ class LogBot(discord.Client):
                 if guild_id:
                     guild_scope_ids.add(int(guild_id))
 
-                # First remove every global command. In particular, this deletes
-                # old global copies of /test and duplicate copies of guild commands.
                 self.tree.clear_commands(guild=None)
                 await self.tree.sync()
                 remote_global = await self.tree.fetch_commands()
@@ -301,8 +283,6 @@ class LogBot(discord.Client):
                         f"commands remain: {sorted(command.name for command in remote_global)}"
                     )
 
-                # This bot is configured for one server. Remove all guild-scoped
-                # commands from every other installed/previously recorded server.
                 for stale_guild_id in sorted(guild_scope_ids - ({int(guild_id)} if guild_id else set())):
                     stale_guild = discord.Object(id=stale_guild_id)
                     try:
@@ -310,9 +290,6 @@ class LogBot(discord.Client):
                         await self.tree.sync(guild=stale_guild)
                         remaining = await self.tree.fetch_commands(guild=stale_guild)
                     except (discord.NotFound, discord.Forbidden):
-                        # The application may have been removed from a formerly
-                        # configured server. Discord may no longer allow cleanup
-                        # there; don't block registration in the current server.
                         logger.warning(
                             "Could not access old command scope for guild %s; "
                             "Discord may already have removed it with the app installation.",
@@ -337,7 +314,6 @@ class LogBot(discord.Client):
                         self.tree.add_command(command, guild=guild, override=True)
                     synced = await self.tree.sync(guild=guild)
                 else:
-                    # Global fallback is only used when no target guild is known.
                     for command in current_commands:
                         self.tree.add_command(command, override=True)
                     synced = await self.tree.sync()
@@ -460,14 +436,10 @@ try:
 except ValueError as exc:
     raise RuntimeError("Saved bot settings in SQLite are invalid.") from exc
 
-# Make the saved /settings values visible to the booster helper modules BEFORE they
-# are imported (some of them read these names from the process environment at import
-# time). This only touches the running process - nothing is written to .env.
 os.environ["BOOSTER_ROLE_ID"] = str(saved_booster_role_id)
 os.environ["STAFF_TEAM_ROLE_ID"] = str(saved_staff_team_role_id)
 os.environ["REVEAL_ARCHIVE_CHANNEL_ID"] = str(saved_reveal_archive_channel_id)
 
-# Imported after load_dotenv() (WATERMARK_SECRET) and after the settings above.
 from booster_commands import booster_reveal as booster
 
 FORUM_CHANNEL_ID = saved_forum_id or FORUM_CHANNEL_ID
@@ -487,8 +459,6 @@ log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
 log_manager.creation_prompt_channel_id = saved_creation_prompt_channel_id
 log_manager.creation_approve_channel_id = saved_creation_approve_channel_id
 
-# Booster reveal system (registers its commands on bot.tree; they are moved into
-# the guild-scoped registration by LogBot.setup_hook).
 booster.install(
     bot,
     booster_role_id=saved_booster_role_id,
@@ -563,6 +533,20 @@ def apply_booster_settings(
         staff_team_role_id=int(staff_team_role_id),
         reveal_archive_channel_id=int(reveal_archive_channel_id),
     )
+
+
+def get_scan_settings() -> tuple[int, str]:
+    try:
+        source_id = int(database.get_setting("scan_guild_id") or "0")
+    except ValueError:
+        source_id = 0
+    reason = database.get_setting("scan_ban_reason") or DEFAULT_SCAN_REASON
+    return source_id, reason
+
+
+def apply_scan_settings(source_guild_id: int, ban_reason: str) -> None:
+    database.set_setting("scan_guild_id", str(int(source_guild_id)))
+    database.set_setting("scan_ban_reason", ban_reason or DEFAULT_SCAN_REASON)
 
 
 @tree.error
