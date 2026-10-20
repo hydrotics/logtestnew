@@ -14,7 +14,10 @@ ApplyForumSettings = Callable[[int, int, bool, int, int], None]
 ApplyCreationSettings = Callable[[int, int], None]
 ApplyBoosterSettings = Callable[[int, int, int], None]
 GetBoosterSettings = Callable[[], tuple[int, int, int]]
+ApplyScanSettings = Callable[[int, str], None]
+GetScanSettings = Callable[[], tuple[int, str]]
 DEFAULT_EMBED_COLOUR = 0x242429
+DEFAULT_SCAN_REASON = "Member of a blacklisted server"
 
 
 def build_settings_command(
@@ -26,6 +29,8 @@ def build_settings_command(
     apply_creation_settings: ApplyCreationSettings,
     apply_booster_settings: ApplyBoosterSettings,
     get_booster_settings: GetBoosterSettings,
+    apply_scan_settings: ApplyScanSettings,
+    get_scan_settings: GetScanSettings,
 ) -> app_commands.Command:
     async def reply(interaction: discord.Interaction, message: str) -> None:
         if interaction.response.is_done():
@@ -50,23 +55,19 @@ def build_settings_command(
         return _has_role(user, int(getattr(manager, "forum_manager_role_id", 0) or 0))
 
     def can_use_general_settings(user: Any) -> bool:
-        """Main config + Creation approval: owner, main staff or booster staff."""
         return (
             user.id == owner_id or is_main_staff(user) or is_booster_staff(user)
         )
 
     def can_use_forum_config(user: Any) -> bool:
-        """Forum config: owner, forum manager role or booster staff."""
         return (
             user.id == owner_id or is_forum_manager(user) or is_booster_staff(user)
         )
 
     def can_use_settings(user: Any) -> bool:
-        """/settings itself: anyone who may open at least one section."""
         return can_use_general_settings(user) or can_use_forum_config(user)
 
     def can_use_booster_config(user: Any) -> bool:
-        """Only the owner or the booster staff role may open Booster config."""
         return user.id == owner_id or is_booster_staff(user)
 
     async def validate_submit_context(
@@ -615,6 +616,76 @@ def build_settings_command(
                 )
             await reply(interaction, message)
 
+    class ScanSettingsModal(discord.ui.Modal, title="Scan Settings"):
+        source_server = discord.ui.Label(
+            text="Blacklisted server ID",
+            description="Shown in scan results as the source. Blank = none.",
+            component=discord.ui.TextInput(
+                style=discord.TextStyle.short,
+                max_length=20,
+                required=False,
+                placeholder="123456789012345678",
+            ),
+        )
+        ban_reason = discord.ui.Label(
+            text="Ban reason",
+            description="Audit log reason used when banning scanned members.",
+            component=discord.ui.TextInput(
+                style=discord.TextStyle.short,
+                max_length=200,
+                required=False,
+                placeholder=DEFAULT_SCAN_REASON,
+            ),
+        )
+
+        def __init__(self) -> None:
+            super().__init__(timeout=300)
+            source_id, reason = get_scan_settings()
+            self.source_server.component.default = str(source_id) if source_id else None
+            self.ban_reason.component.default = reason
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            if not await validate_submit_context(interaction):
+                return
+            guild = interaction.guild
+            assert guild is not None
+
+            raw_id = self.source_server.component.value.strip()
+            source_id = 0
+            if raw_id:
+                if not re.fullmatch(r"\d{17,20}", raw_id):
+                    await reply(
+                        interaction,
+                        "Enter a valid server ID (17-20 digits) or leave it blank.",
+                    )
+                    return
+                source_id = int(raw_id)
+                if source_id == guild.id:
+                    await reply(
+                        interaction,
+                        "The blacklisted server cannot be this server.",
+                    )
+                    return
+
+            reason = self.ban_reason.component.value.strip() or DEFAULT_SCAN_REASON
+
+            try:
+                apply_scan_settings(source_id, reason)
+            except Exception:
+                logger.exception("Could not save scan settings")
+                await reply(
+                    interaction,
+                    "I could not save the scan settings. Check the bot logs and try again.",
+                )
+                return
+
+            await reply(
+                interaction,
+                "**Scan settings saved.**\n"
+                f"Blacklisted server ID: {f'`{source_id}`' if source_id else 'not set'}\n"
+                f"Ban reason: {reason}",
+            )
+
     class SettingsMenuView(discord.ui.View):
         def __init__(self) -> None:
             super().__init__(timeout=300)
@@ -696,9 +767,22 @@ def build_settings_command(
             if await self._owner_only(interaction):
                 await interaction.response.send_modal(CreationApprovalModal())
 
+        @discord.ui.button(
+            label="Scan settings",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        async def scan_settings(
+            self,
+            interaction: discord.Interaction,
+            button: discord.ui.Button,
+        ) -> None:
+            if await self._owner_only(interaction):
+                await interaction.response.send_modal(ScanSettingsModal())
+
     @app_commands.command(
         name="settings",
-        description="Configure bot logging, roles, embed colour, and creation channels (staff only).",
+        description="Configure bot logging, roles, embed colour, creation channels and scans (staff only).",
     )
     @app_commands.guild_only()
     async def settings(interaction: discord.Interaction) -> None:
