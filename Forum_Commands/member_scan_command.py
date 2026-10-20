@@ -183,6 +183,13 @@ class ScanView(discord.ui.LayoutView):
         await interaction.response.edit_message(view=self)
 
     async def on_ban(self, interaction: discord.Interaction) -> None:
+        if not self.guild.me.guild_permissions.ban_members:
+            await interaction.response.send_message(
+                "I need the Ban Members permission to ban members.",
+                ephemeral=True,
+            )
+            return
+
         if not self.confirming:
             self.confirming = True
             self.render()
@@ -268,11 +275,6 @@ def build_member_scan_command(
         if guild is None:
             await interaction.response.send_message(
                 "Run this command inside the server.", ephemeral=True
-            )
-            return
-        if not guild.me.guild_permissions.ban_members:
-            await interaction.response.send_message(
-                "I need the Ban Members permission to run a scan.", ephemeral=True
             )
             return
         if file.size > MAX_FILE_BYTES:
