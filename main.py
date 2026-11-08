@@ -32,9 +32,8 @@ create_log_module.build_status_embed = _build_status_embed_with_global_colour
 
 from Forum_Commands.create_log_command import build_create_log_commands
 from Forum_Commands.creation_prompt_command import setup_creation_prompt
-from Forum_Commands.member_scan_command import build_member_scan_command
 from Forum_Commands.status_command import build_status_command
-from settings import DEFAULT_SCAN_REASON, build_settings_command
+from settings import build_settings_command
 
 load_dotenv()
 
@@ -223,17 +222,10 @@ class LogBot(discord.Client):
             apply_creation_settings=apply_creation_settings,
             apply_booster_settings=apply_booster_settings,
             get_booster_settings=get_booster_settings,
-            apply_scan_settings=apply_scan_settings,
-            get_scan_settings=get_scan_settings,
         )
         forum_commands = (
             build_create_log_commands(manager=log_manager, owner_id=BOT_OWNER_ID),
             build_status_command(manager=log_manager, owner_id=BOT_OWNER_ID),
-            build_member_scan_command(
-                manager=log_manager,
-                owner_id=BOT_OWNER_ID,
-                get_scan_settings=get_scan_settings,
-            ),
             creation_prompt_command,
             settings_command,
         )
@@ -533,20 +525,6 @@ def apply_booster_settings(
         staff_team_role_id=int(staff_team_role_id),
         reveal_archive_channel_id=int(reveal_archive_channel_id),
     )
-
-
-def get_scan_settings() -> tuple[int, str]:
-    try:
-        source_id = int(database.get_setting("scan_guild_id") or "0")
-    except ValueError:
-        source_id = 0
-    reason = database.get_setting("scan_ban_reason") or DEFAULT_SCAN_REASON
-    return source_id, reason
-
-
-def apply_scan_settings(source_guild_id: int, ban_reason: str) -> None:
-    database.set_setting("scan_guild_id", str(int(source_guild_id)))
-    database.set_setting("scan_ban_reason", ban_reason or DEFAULT_SCAN_REASON)
 
 
 @tree.error
