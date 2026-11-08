@@ -84,13 +84,15 @@ def setup_creation_prompt(
         submitter_id: int,
         staff_id: int,
         accepted: bool,
+        reason: str | None = None,
     ) -> discord.Embed:
         verdict = "Accepted" if accepted else "Denied"
         timestamp = int(discord.utils.utcnow().timestamp())
-        info_value = (
-            f"**Submitted by:** <@{submitter_id}>\n"
-            f"**Status:** {verdict} by <@{staff_id}> · <t:{timestamp}:R>"
-        )
+        status_line = f"**Status:** {verdict} by <@{staff_id}> · <t:{timestamp}:R>"
+        if not accepted and reason:
+            safe_reason = reason.replace("`", "'")
+            status_line += f" · `{safe_reason}`"
+        info_value = f"**Submitted by:** <@{submitter_id}>\n{status_line}"
         info_index = next(
             (index for index, field in enumerate(embed.fields) if field.name == "Information"),
             None,
@@ -106,6 +108,27 @@ def setup_creation_prompt(
             )
         embed.colour = ACCEPTED_COLOUR if accepted else DENIED_COLOUR
         return embed
+
+    class DenyReasonModal(discord.ui.Modal, title="Deny creation"):
+        reason = discord.ui.Label(
+            text="Denial reason",
+            component=discord.ui.TextInput(
+                style=discord.TextStyle.paragraph,
+                max_length=500,
+                required=True,
+            ),
+        )
+
+        def __init__(self, review_item: Any, review_message: discord.Message) -> None:
+            super().__init__()
+            self.review_item = review_item
+            self.review_message = review_message
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            reason = (self.reason.component.value or "").strip()
+            await self.review_item._run_review(
+                interaction, self.review_message, False, reason
+            )
 
     class ReviewSelect(
         discord.ui.DynamicItem[discord.ui.Select],
@@ -150,9 +173,34 @@ def setup_creation_prompt(
                 await reply(interaction, "This submission is already being reviewed.")
                 return
 
+            accepted = bool(self.item.values and self.item.values[0] == "accept")
+            if accepted:
+                await self._run_review(interaction, message, True)
+                return
+
+            # Denials ask for a reason first. The lock is only taken once the
+            # modal is submitted, so closing the modal can't leave it stuck.
+            await interaction.response.send_modal(DenyReasonModal(self, message))
+            try:
+                # Reset the select so "Deny" doesn't stay highlighted if cancelled.
+                await message.edit(view=review_view(self.user_id))
+            except (discord.HTTPException, AttributeError):
+                pass
+
+        async def _run_review(
+            self,
+            interaction: discord.Interaction,
+            message: discord.Message,
+            accepted: bool,
+            reason: str | None = None,
+        ) -> None:
+            if message.id in _reviewing:
+                await reply(interaction, "This submission is already being reviewed.")
+                return
+
             _reviewing.add(message.id)
             try:
-                await self._review(interaction, message)
+                await self._review(interaction, message, accepted, reason)
             finally:
                 _reviewing.discard(message.id)
 
@@ -160,8 +208,9 @@ def setup_creation_prompt(
             self,
             interaction: discord.Interaction,
             message: discord.Message,
+            accepted: bool,
+            reason: str | None = None,
         ) -> None:
-            accepted = bool(self.item.values and self.item.values[0] == "accept")
             await interaction.response.defer()
 
             source_message = await fetch_latest_message(message)
@@ -175,6 +224,7 @@ def setup_creation_prompt(
             source_embed = discord.Embed.from_dict(source_message.embeds[0].to_dict())
             attachments = list(source_message.attachments)
             media_files: list[discord.File] = []
+            dm_failed = False
 
             try:
                 # Convert every uploaded attachment to a real file. Give duplicate
@@ -316,6 +366,7 @@ def setup_creation_prompt(
                     submitter_id=self.user_id,
                     staff_id=interaction.user.id,
                     accepted=accepted,
+                    reason=reason,
                 )
                 edit_attachments: list[Any] = list(source_message.attachments)
                 if not accepted and not edit_attachments and media_files:
@@ -329,6 +380,60 @@ def setup_creation_prompt(
                     view=review_view(self.user_id, disabled=True),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+
+                if not accepted:
+                    def quote_block(text: str, limit: int) -> str:
+                        text = (text or "").strip() or "—"
+                        if len(text) > limit:
+                            text = text[: limit - 3].rstrip() + "..."
+                        return "\n".join(
+                            f"> {line}" if line.strip() else ">"
+                            for line in text.splitlines()
+                        )
+
+                    submission_quote = quote_block(source_embed.description or "", 1000)
+                    reason_quote = quote_block(reason or "No reason provided.", 1000)
+                    try:
+                        target = (
+                            interaction.guild.get_member(self.user_id)
+                            if interaction.guild
+                            else None
+                        )
+                        if target is None:
+                            target = await interaction.client.fetch_user(self.user_id)
+                        dm_embed = discord.Embed(
+                            title="Creation Submission Denied",
+                            description=(
+                                "Unfortunately, your creation submission has been "
+                                "**denied** by staff."
+                            ),
+                            colour=DENIED_COLOUR,
+                            timestamp=discord.utils.utcnow(),
+                        )
+                        dm_embed.add_field(
+                            name="Your Submission",
+                            value=submission_quote,
+                            inline=False,
+                        )
+                        dm_embed.add_field(
+                            name="Reason",
+                            value=reason_quote,
+                            inline=False,
+                        )
+                        dm_guild = interaction.guild
+                        if dm_guild is not None:
+                            dm_embed.set_footer(
+                                text=dm_guild.name,
+                                icon_url=dm_guild.icon.url if dm_guild.icon else None,
+                            )
+                        await target.send(embed=dm_embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        dm_failed = True
+                        logger.warning(
+                            "Could not DM denial reason to user %s",
+                            self.user_id,
+                            exc_info=True,
+                        )
             except (discord.HTTPException, OSError, aiohttp.ClientError, ValueError):
                 logger.exception(
                     "Could not process creation review for %s (message %s)",
@@ -345,7 +450,10 @@ def setup_creation_prompt(
                     media_file.close()
 
             verdict = "accepted" if accepted else "denied"
-            await interaction.followup.send(f"Submission {verdict}.", ephemeral=True)
+            note = " (I couldn't DM the user.)" if (not accepted and dm_failed) else ""
+            await interaction.followup.send(
+                f"Submission {verdict}.{note}", ephemeral=True
+            )
 
         async def _fail(
             self,
