@@ -15,7 +15,6 @@ import sys
 import threading
 import time
 import weakref
-import inspect
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,14 +29,13 @@ from PIL import Image
 BASE_DIR = Path(__file__).resolve().parent
 
 # This file lives in the booster_commands/ folder next to reveal_history.py,
-# stresstest.py, status.py and watermark.py. Make the folder importable so any
+# status.py and watermark.py. Make the folder importable so any
 # plain sibling imports inside those files keep working.
 if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
 
 try:
     from reveal_history import ArchiveServedUsersView, RevealHistoryError, RevealHistoryStore, make_history_command
-    from stresstest import install_stress_test
     from status import StatusTracker
 except ImportError:
     # Fallback if those files use package-relative imports internally.
@@ -47,7 +45,6 @@ except ImportError:
         RevealHistoryStore,
         make_history_command,
     )
-    from booster_commands.stresstest import install_stress_test
     from booster_commands.status import StatusTracker
 
 # ---------------------------------------------------------------------------
@@ -169,7 +166,7 @@ BOOSTER_COMMAND_NAMES: set[str] = set()
 
 class _HistoryProxy:
     """Forwards everything to the current RevealHistoryStore. The history command,
-    the archive view and the stress tools keep this one object, so a changed archive
+    the archive view and other helpers keep this one object, so a changed archive
     channel from /settings takes effect without restarting the bot."""
 
     def __init__(self, store) -> None:
@@ -1836,8 +1833,8 @@ def install(
     reveal_archive_channel_id: int,
     owner_id: int = 0,
 ) -> None:
-    """Create the history store, register every booster command on the shared tree
-    and install the stress-test tooling. Call once, after the client exists."""
+    """Create the history store and register every booster command on the shared tree.
+    Call once, after the client exists."""
     global bot, HISTORY, BOT_OWNER_ID
     try:
         BOT_OWNER_ID = int(owner_id or os.getenv("BOT_OWNER_ID", "").strip() or 0)
@@ -1854,13 +1851,6 @@ def install(
         )
     )
 
-    if inspect.iscoroutinefunction(HISTORY.record_stress_test_users):
-        async def record_test_users(*args, **kwargs):
-            return await HISTORY.record_stress_test_users(*args, **kwargs)
-    else:
-        def record_test_users(*args, **kwargs):
-            return HISTORY.record_stress_test_users(*args, **kwargs)
-
     client.tree.add_command(reveal_status)
     client.tree.add_command(upload)
     client.tree.add_command(view_reveal)
@@ -1875,26 +1865,6 @@ def install(
             staff_role_id=lambda: STAFF_TEAM_ROLE_ID,
             owner_id=BOT_OWNER_ID,
         )
-    )
-
-    install_stress_test(
-        client,
-        get_current_reveal=lambda: CURRENT_REVEAL,
-        ensure_reveal_source=ensure_reveal_source,
-        build_personalized_reveal=build_personalized_reveal,
-        compute_video_target_bytes=compute_video_target_bytes,
-        run_worker=run_worker,
-        process_sem=process_sem,
-        get_worker_procs=lambda: list(WORKER_PROCS),
-        cache_dir=CACHE_DIR,
-        tmp_dir=TMP_DIR,
-        max_video_height=MAX_VIDEO_HEIGHT,
-        trace_image_budget=TRACE_IMAGE_TIME_BUDGET,
-        trace_video_budget=TRACE_VIDEO_TIME_BUDGET,
-        cache_path_for=cache_path_for,
-        history_store=HISTORY,
-        record_test_users=record_test_users,
-        staff_role_id=STAFF_TEAM_ROLE_ID,
     )
 
 
