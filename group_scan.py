@@ -17,14 +17,6 @@ logger = logging.getLogger("discord-log-bot.group_scan")
 
 GROUP_ID = 33955777
 GROUP_ROLE: str | int | list[str | int] = 107818007
-BOOSTER_ID = 1560413737578659840
-BOOSTER_BUTTON_THREAD = 1571124508184547328
-BOOSTER_RANK = 1561794561930428536
-ROLESHIFT_CHANNEL = 1561789572894036040
-GROUP_NAME = "Mythic Reliques"
-ROLESHIFT_FROM = "Booster"
-ROLESHIFT_TO = "Player"
-
 
 def get_group_rank_settings() -> tuple[int, int, int, int, str, str, str]:
     return (
