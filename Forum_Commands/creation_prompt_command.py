@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from io import BytesIO
+import os
+import tempfile
 from types import MethodType
 from typing import Any
 
@@ -24,6 +25,7 @@ MEDIA_TYPES = ("image/", "video/")
 def configured_embed_colour(manager: Any) -> discord.Colour:
     colour = getattr(manager, "embed_colour", None)
     return colour if isinstance(colour, discord.Colour) else EMBED_COLOUR
+
 
 _reviewing: set[int] = set()
 _registered_clients: set[int] = set()
@@ -58,6 +60,41 @@ def setup_creation_prompt(
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+
+    async def download_to_path(
+        session: aiohttp.ClientSession,
+        url: str,
+        path: str,
+    ) -> None:
+        """Stream a Discord CDN attachment to disk without loading it into RAM."""
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with session.get(url, timeout=timeout) as response:
+            response.raise_for_status()
+            with open(path, "wb") as output_file:
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    output_file.write(chunk)
+
+    def safe_filename(filename: str) -> str:
+        # Prevent path components in a user-supplied attachment filename from
+        # being interpreted as part of the temporary file path.
+        filename = (filename or "upload").replace("\\", "/").rsplit("/", 1)[-1]
+        return filename.strip() or "upload"
+
+    def unique_filename(filename: str, used_filenames: set[str]) -> str:
+        original_filename = safe_filename(filename)
+        stem, dot, extension = original_filename.rpartition(".")
+        if not dot:
+            stem, extension = original_filename, ""
+
+        candidate = original_filename
+        duplicate_index = 2
+        while candidate in used_filenames:
+            suffix = f".{extension}" if extension else ""
+            candidate = f"{stem}_{duplicate_index}{suffix}"
+            duplicate_index += 1
+
+        used_filenames.add(candidate)
+        return candidate
 
     def review_view(user_id: int, *, disabled: bool = False) -> discord.ui.View:
         view = discord.ui.View(timeout=None)
@@ -224,51 +261,68 @@ def setup_creation_prompt(
             source_embed = discord.Embed.from_dict(source_message.embeds[0].to_dict())
             attachments = list(source_message.attachments)
             media_files: list[discord.File] = []
+            review_media_files: list[discord.File] = []
             dm_failed = False
+            temporary_directory = tempfile.TemporaryDirectory(
+                prefix="creation-review-"
+            )
 
             try:
-                # Convert every uploaded attachment to a real file. Give duplicate
-                # filenames unique names so each Components V2 File component can
-                # resolve its own uploaded attachment reliably.
-                if attachments:
+                # Only accepted submissions need their original attachments
+                # downloaded for a second upload. Denied submissions keep their
+                # existing review-channel attachments and are never downloaded.
+                if accepted and attachments:
                     used_filenames: set[str] = set()
-                    for attachment in attachments:
-                        uploaded_file = await attachment.to_file()
-                        original_filename = uploaded_file.filename or "upload"
-                        stem, dot, extension = original_filename.rpartition(".")
-                        if not dot:
-                            stem, extension = original_filename, ""
-                        candidate = original_filename
-                        duplicate_index = 2
-                        while candidate in used_filenames:
-                            suffix = f".{extension}" if extension else ""
-                            candidate = f"{stem}_{duplicate_index}{suffix}"
-                            duplicate_index += 1
-                        uploaded_file.filename = candidate
-                        used_filenames.add(candidate)
-                        media_files.append(uploaded_file)
-                else:
-                    # Recovery fallback for older submissions where only an embed
-                    # image URL remains. This is downloaded and re-uploaded privately.
+                    async with aiohttp.ClientSession() as session:
+                        for index, attachment in enumerate(attachments):
+                            filename = unique_filename(
+                                attachment.filename or "upload",
+                                used_filenames,
+                            )
+                            temporary_path = os.path.join(
+                                temporary_directory.name,
+                                f"attachment_{index}",
+                            )
+                            await download_to_path(
+                                session,
+                                str(attachment.url),
+                                temporary_path,
+                            )
+                            media_files.append(
+                                discord.File(temporary_path, filename=filename)
+                            )
+                elif not attachments:
+                    # Recovery fallback for older submissions where only an
+                    # embed image URL remains. Stream it to disk rather than
+                    # loading the complete image into memory. Keep a separate
+                    # upload for the review message so the media remains visible
+                    # there after acceptance as well as denial.
                     image_url = source_embed.image.url if source_embed.image else None
                     if image_url and image_url.startswith(("https://", "http://")):
+                        filename = (
+                            image_url.split("?", 1)[0].rsplit("/", 1)[-1]
+                            or "creation-image.png"
+                        )
+                        if "." not in filename:
+                            filename += ".png"
+                        filename = unique_filename(filename, set())
+                        temporary_path = os.path.join(
+                            temporary_directory.name,
+                            "creation_image",
+                        )
                         async with aiohttp.ClientSession() as session:
-                            async with session.get(
+                            await download_to_path(
+                                session,
                                 image_url,
-                                timeout=aiohttp.ClientTimeout(total=20),
-                            ) as response:
-                                response.raise_for_status()
-                                data = await response.read()
-                                if data:
-                                    filename = (
-                                        image_url.split("?", 1)[0].rsplit("/", 1)[-1]
-                                        or "creation-image.png"
-                                    )
-                                    if "." not in filename:
-                                        filename += ".png"
-                                    media_files.append(
-                                        discord.File(BytesIO(data), filename=filename)
-                                    )
+                                temporary_path,
+                            )
+                        review_media_files.append(
+                            discord.File(temporary_path, filename=filename)
+                        )
+                        if accepted:
+                            media_files.append(
+                                discord.File(temporary_path, filename=filename)
+                            )
 
                 if accepted:
                     channel = text_channel(
@@ -355,12 +409,13 @@ def setup_creation_prompt(
                     )
                     media_files = []  # discord.py has consumed/closed them
 
-                # Update status but keep the existing attachment on the review
-                # message. This prevents the image from becoming a separate file.
-                # The uploaded media should remain a normal attachment below the
-                # review/status embed, not be rendered inside the embed itself.
-                source_embed.set_image(url=None)
-                source_embed.set_thumbnail(url=None)
+                # Keep the original review-channel attachments in place. If an
+                # older submission only has an embed image URL, replace it with
+                # a real attachment so it remains visible in the review channel.
+                if attachments or review_media_files:
+                    source_embed.set_image(url=None)
+                    source_embed.set_thumbnail(url=None)
+
                 status_embed = update_submission_status(
                     source_embed,
                     submitter_id=self.user_id,
@@ -369,10 +424,7 @@ def setup_creation_prompt(
                     reason=reason,
                 )
                 edit_attachments: list[Any] = list(source_message.attachments)
-                if not accepted and not edit_attachments and media_files:
-                    # Restore media if the original attachment was already missing.
-                    edit_attachments = media_files
-                    media_files = []
+                edit_attachments.extend(review_media_files)
 
                 await source_message.edit(
                     embed=status_embed,
@@ -380,6 +432,7 @@ def setup_creation_prompt(
                     view=review_view(self.user_id, disabled=True),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+                review_media_files = []  # discord.py has consumed/closed them
 
                 if not accepted:
                     def quote_block(text: str, limit: int) -> str:
@@ -448,6 +501,9 @@ def setup_creation_prompt(
             finally:
                 for media_file in media_files:
                     media_file.close()
+                for media_file in review_media_files:
+                    media_file.close()
+                temporary_directory.cleanup()
 
             verdict = "accepted" if accepted else "denied"
             note = " (I couldn't DM the user.)" if (not accepted and dm_failed) else ""
@@ -501,44 +557,66 @@ def setup_creation_prompt(
             await interaction.response.defer(ephemeral=True)
 
             user = interaction.user
-            uploaded_files = [await attachment.to_file() for attachment in attachments]
-            embed = discord.Embed(
-                description=self.details.component.value,
-                colour=configured_embed_colour(manager),
-            )
-            embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
-            embed.add_field(
-                name="Information",
-                value=f"**Submitted by:** {user.mention}\n**Status:** Pending review",
-                inline=False,
-            )
-            filenames = "\n".join(
-                f"• `{uploaded_file.filename}`" for uploaded_file in uploaded_files
-            )
-            embed.add_field(
-                name=f"Attachments ({len(uploaded_files)})",
-                value=filenames[:1024],
-                inline=False,
-            )
-            # Keep all media as normal message attachments, not embed images.
+            uploaded_files: list[discord.File] = []
+            with tempfile.TemporaryDirectory(prefix="creation-submission-") as temp_dir:
+                try:
+                    used_filenames: set[str] = set()
+                    async with aiohttp.ClientSession() as session:
+                        for index, attachment in enumerate(attachments):
+                            filename = unique_filename(
+                                attachment.filename or "upload",
+                                used_filenames,
+                            )
+                            temporary_path = os.path.join(
+                                temp_dir,
+                                f"attachment_{index}",
+                            )
+                            await download_to_path(
+                                session,
+                                str(attachment.url),
+                                temporary_path,
+                            )
+                            uploaded_files.append(
+                                discord.File(temporary_path, filename=filename)
+                            )
 
-            try:
-                await channel.send(
-                    embed=embed,
-                    files=uploaded_files,
-                    view=review_view(user.id),
-                )
-            except discord.HTTPException:
-                for uploaded_file in uploaded_files:
-                    uploaded_file.close()
-                logger.exception(
-                    "Could not forward creation submission from %s", user.id
-                )
-                await reply(
-                    interaction,
-                    "Your submission could not be sent. Please try again later.",
-                )
-                return
+                    embed = discord.Embed(
+                        description=self.details.component.value,
+                        colour=configured_embed_colour(manager),
+                    )
+                    embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
+                    embed.add_field(
+                        name="Information",
+                        value=f"**Submitted by:** {user.mention}\n**Status:** Pending review",
+                        inline=False,
+                    )
+                    filenames = "\n".join(
+                        f"• `{uploaded_file.filename}`" for uploaded_file in uploaded_files
+                    )
+                    embed.add_field(
+                        name=f"Attachments ({len(uploaded_files)})",
+                        value=filenames[:1024],
+                        inline=False,
+                    )
+                    # Keep all media as normal message attachments, not embed images.
+
+                    await channel.send(
+                        embed=embed,
+                        files=uploaded_files,
+                        view=review_view(user.id),
+                    )
+                except (discord.HTTPException, OSError, aiohttp.ClientError, ValueError):
+                    logger.exception(
+                        "Could not forward creation submission from %s", user.id
+                    )
+                    await reply(
+                        interaction,
+                        "Your submission could not be sent. Please try again later.",
+                    )
+                    return
+                finally:
+                    for uploaded_file in uploaded_files:
+                        uploaded_file.close()
 
             await reply(
                 interaction,
