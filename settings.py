@@ -49,7 +49,7 @@ DEFAULT_SETTINGS: dict[str, dict[str, int | bool | str]] = {
         "booster_role_id": 1272315425966784621,
         "username_thread_id": 1276526692026028042,
         "booster_rank_channel_id": 0,
-        "roleshift_channel_id": 0,
+        "roleshift_channel_id": 1354041307500380172,
         "group_name": "Mythic Reliques",
         "roleshift_from": "Booster",
         "roleshift_to": "Player",
@@ -701,14 +701,14 @@ def build_settings_command(
             ),
         )
         roleshift_channel = discord.ui.Label(
-            text="Roleshift channel",
-            description="Text channel where confirmed roleshift logs are posted.",
-            component=discord.ui.ChannelSelect(
-                channel_types=[discord.ChannelType.text],
-                placeholder="Select the roleshift channel",
-                min_values=1,
-                max_values=1,
+            text="Roleshift forum post ID",
+            description="Forum post where confirmed roleshift logs are posted.",
+            component=discord.ui.TextInput(
+                style=discord.TextStyle.short,
+                min_length=1,
+                max_length=20,
                 required=True,
+                placeholder="Discord forum post ID",
             ),
         )
 
@@ -734,8 +734,8 @@ def build_settings_command(
                 if booster_rank_channel_id
                 else []
             )
-            self.roleshift_channel.component.default_values = (
-                [discord.Object(id=roleshift_channel_id)] if roleshift_channel_id else []
+            self.roleshift_channel.component.default = (
+                str(roleshift_channel_id) if roleshift_channel_id else ""
             )
 
         async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -746,11 +746,10 @@ def build_settings_command(
 
             role_values = self.booster_role.component.values
             rank_channel_values = self.booster_rank_channel.component.values
-            roleshift_channel_values = self.roleshift_channel.component.values
-            if not role_values or not rank_channel_values or not roleshift_channel_values:
+            if not role_values or not rank_channel_values:
                 await reply(
                     interaction,
-                    "Select the booster role, booster rank channel and roleshift channel.",
+                    "Select the booster role and booster rank channel.",
                 )
                 return
 
@@ -786,19 +785,63 @@ def build_settings_command(
                 return
 
             booster_rank_channel_id = int(rank_channel_values[0].id)
-            roleshift_channel_id = int(roleshift_channel_values[0].id)
             booster_rank_channel = guild.get_channel(booster_rank_channel_id)
-            roleshift_channel = guild.get_channel(roleshift_channel_id)
             if not isinstance(booster_rank_channel, discord.TextChannel):
                 await reply(
                     interaction,
                     "The booster rank channel must be a text channel in this server.",
                 )
                 return
-            if not isinstance(roleshift_channel, discord.TextChannel):
+
+            raw_roleshift_thread_id = (
+                self.roleshift_channel.component.value or ""
+            ).strip()
+            if (
+                not raw_roleshift_thread_id.isdigit()
+                or int(raw_roleshift_thread_id) <= 0
+            ):
+                await reply(interaction, "Enter a valid Discord forum post ID.")
+                return
+
+            roleshift_channel_id = int(raw_roleshift_thread_id)
+            roleshift_thread = guild.get_thread(roleshift_channel_id)
+            if roleshift_thread is None:
+                try:
+                    roleshift_thread = await interaction.client.fetch_channel(
+                        roleshift_channel_id
+                    )
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    await reply(interaction, "I couldn't access that forum post.")
+                    return
+
+            if (
+                not isinstance(roleshift_thread, discord.Thread)
+                or roleshift_thread.guild is None
+                or roleshift_thread.guild.id != guild.id
+            ):
                 await reply(
                     interaction,
-                    "The roleshift channel must be a text channel in this server.",
+                    "The roleshift ID must belong to a forum post in this server.",
+                )
+                return
+
+            roleshift_parent = roleshift_thread.parent
+            if roleshift_parent is None:
+                try:
+                    roleshift_parent = await interaction.client.fetch_channel(
+                        roleshift_thread.parent_id
+                    )
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    await reply(
+                        interaction,
+                        "I couldn't access the forum containing that post.",
+                    )
+                    return
+
+            if not isinstance(roleshift_parent, discord.ForumChannel):
+                await reply(
+                    interaction,
+                    "The roleshift ID must belong to a post inside a forum channel.",
                 )
                 return
 
@@ -827,7 +870,7 @@ def build_settings_command(
                 f"Booster role: <@&{booster_role_id}>\n"
                 f"Username thread: {thread.mention}\n"
                 f"Booster rank channel: {booster_rank_channel.mention}\n"
-                f"Roleshift channel: {roleshift_channel.mention}\n\n"
+                f"Roleshift forum post: {roleshift_thread.mention}\n\n"
                 "The defaults in `settings.py` will be applied again on the next restart.",
             )
 
