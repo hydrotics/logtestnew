@@ -14,7 +14,58 @@ ApplyForumSettings = Callable[[int, int, bool, int, int], None]
 ApplyCreationSettings = Callable[[int, int], None]
 ApplyBoosterSettings = Callable[[int, int, int], None]
 GetBoosterSettings = Callable[[], tuple[int, int, int]]
+ApplyGroupRankSettings = Callable[[int, int, int, int, str, str, str], None]
+GetGroupRankSettings = Callable[[], tuple[int, int, int, int, str, str, str]]
 DEFAULT_EMBED_COLOUR = 0x242429
+
+# These values are applied every time the bot starts and override any older
+# settings stored in SQLite. Changes made through /settings apply only until
+# the next restart, when these defaults are applied again.
+# Replace 0 with the relevant Discord role, channel or server ID.
+# Keep 0 for an unset/disabled option.
+DEFAULT_SETTINGS: dict[str, dict[str, int | bool | str]] = {
+    "main": {
+        "staff_role_id": 0,
+        "embed_colour": DEFAULT_EMBED_COLOUR,
+    },
+    "forum": {
+        "forum_channel_id": 0,
+        "target_role_id": 0,
+        "auto_create_enabled": False,
+        "guild_id": 0,
+        "forum_manager_role_id": 0,
+    },
+    "creation": {
+        "creation_prompt_channel_id": 0,
+        "creation_approve_channel_id": 0,
+    },
+    "booster": {
+        "booster_role_id": 0,
+        "staff_team_role_id": 0,
+        "reveal_archive_channel_id": 0,
+    },
+    # These are Discord/server settings. GROUP_ID and GROUP_ROLE remain in group_scan.py.
+    "booster_group_rank": {
+        "booster_role_id": 1560413737578659840,
+        "username_thread_id": 1571124508184547328,
+        "booster_rank_channel_id": 1561794561930428536,
+        "roleshift_channel_id": 1561789572894036040,
+        "group_name": "Mythic Reliques",
+        "roleshift_from": "Booster",
+        "roleshift_to": "Player",
+    },
+}
+
+
+def is_main_staff_or_owner(user: Any, *, manager: Any, owner_id: int) -> bool:
+    if getattr(user, "id", None) == owner_id:
+        return True
+    role_id = int(getattr(manager, "staff_role_id", 0) or 0)
+    return (
+        bool(role_id)
+        and isinstance(user, discord.Member)
+        and user.get_role(role_id) is not None
+    )
 
 
 def build_settings_command(
@@ -26,6 +77,8 @@ def build_settings_command(
     apply_creation_settings: ApplyCreationSettings,
     apply_booster_settings: ApplyBoosterSettings,
     get_booster_settings: GetBoosterSettings,
+    apply_group_rank_settings: ApplyGroupRankSettings,
+    get_group_rank_settings: GetGroupRankSettings,
 ) -> app_commands.Command:
     async def reply(interaction: discord.Interaction, message: str) -> None:
         if interaction.response.is_done():
@@ -64,6 +117,9 @@ def build_settings_command(
 
     def can_use_booster_config(user: Any) -> bool:
         return user.id == owner_id or is_booster_staff(user)
+
+    def can_manage_group_rank(user: Any) -> bool:
+        return is_main_staff_or_owner(user, manager=manager, owner_id=owner_id)
 
     async def validate_submit_context(
         interaction: discord.Interaction,
@@ -611,6 +667,170 @@ def build_settings_command(
                 )
             await reply(interaction, message)
 
+    class BoosterGroupRankChannelsModal(discord.ui.Modal, title="Booster Group Rank"):
+        booster_role = discord.ui.Label(
+            text="Booster role",
+            description="Discord role used to check whether a member is still boosting.",
+            component=discord.ui.RoleSelect(
+                placeholder="Select the Discord booster role",
+                min_values=1,
+                max_values=1,
+                required=True,
+            ),
+        )
+        username_thread = discord.ui.Label(
+            text="Username thread ID",
+            description="Thread where the booster username-request button is posted.",
+            component=discord.ui.TextInput(
+                style=discord.TextStyle.short,
+                min_length=1,
+                max_length=20,
+                required=True,
+                placeholder="Discord thread ID",
+            ),
+        )
+        booster_rank_channel = discord.ui.Label(
+            text="Booster rank channel",
+            description="Text channel where booster rank requests are reviewed.",
+            component=discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Select the booster rank channel",
+                min_values=1,
+                max_values=1,
+                required=True,
+            ),
+        )
+        roleshift_channel = discord.ui.Label(
+            text="Roleshift channel",
+            description="Text channel where confirmed roleshift logs are posted.",
+            component=discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Select the roleshift channel",
+                min_values=1,
+                max_values=1,
+                required=True,
+            ),
+        )
+
+        def __init__(self) -> None:
+            super().__init__(timeout=300)
+            (
+                booster_role_id,
+                username_thread_id,
+                booster_rank_channel_id,
+                roleshift_channel_id,
+                _,
+                _,
+                _,
+            ) = get_group_rank_settings()
+            self.booster_role.component.default_values = (
+                [discord.Object(id=booster_role_id)] if booster_role_id else []
+            )
+            self.username_thread.component.default = (
+                str(username_thread_id) if username_thread_id else ""
+            )
+            self.booster_rank_channel.component.default_values = (
+                [discord.Object(id=booster_rank_channel_id)]
+                if booster_rank_channel_id
+                else []
+            )
+            self.roleshift_channel.component.default_values = (
+                [discord.Object(id=roleshift_channel_id)] if roleshift_channel_id else []
+            )
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            if not await validate_submit_context(interaction, can_manage_group_rank):
+                return
+            guild = interaction.guild
+            assert guild is not None
+
+            role_values = self.booster_role.component.values
+            rank_channel_values = self.booster_rank_channel.component.values
+            roleshift_channel_values = self.roleshift_channel.component.values
+            if not role_values or not rank_channel_values or not roleshift_channel_values:
+                await reply(
+                    interaction,
+                    "Select the booster role, booster rank channel and roleshift channel.",
+                )
+                return
+
+            booster_role_id = int(role_values[0].id)
+            if booster_role_id == guild.id or guild.get_role(booster_role_id) is None:
+                await reply(
+                    interaction,
+                    "The selected booster role could not be found in this server.",
+                )
+                return
+
+            raw_thread_id = (self.username_thread.component.value or "").strip()
+            if not raw_thread_id.isdigit() or int(raw_thread_id) <= 0:
+                await reply(interaction, "Enter a valid Discord thread ID.")
+                return
+            username_thread_id = int(raw_thread_id)
+            thread = guild.get_thread(username_thread_id)
+            if thread is None:
+                try:
+                    thread = await interaction.client.fetch_channel(username_thread_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    await reply(interaction, "I couldn't access that username thread.")
+                    return
+            if (
+                not isinstance(thread, discord.Thread)
+                or thread.guild is None
+                or thread.guild.id != guild.id
+            ):
+                await reply(
+                    interaction,
+                    "The username thread ID must belong to a thread in this server.",
+                )
+                return
+
+            booster_rank_channel_id = int(rank_channel_values[0].id)
+            roleshift_channel_id = int(roleshift_channel_values[0].id)
+            booster_rank_channel = guild.get_channel(booster_rank_channel_id)
+            roleshift_channel = guild.get_channel(roleshift_channel_id)
+            if not isinstance(booster_rank_channel, discord.TextChannel):
+                await reply(
+                    interaction,
+                    "The booster rank channel must be a text channel in this server.",
+                )
+                return
+            if not isinstance(roleshift_channel, discord.TextChannel):
+                await reply(
+                    interaction,
+                    "The roleshift channel must be a text channel in this server.",
+                )
+                return
+
+            current = get_group_rank_settings()
+            try:
+                apply_group_rank_settings(
+                    booster_role_id,
+                    username_thread_id,
+                    booster_rank_channel_id,
+                    roleshift_channel_id,
+                    current[4],
+                    current[5],
+                    current[6],
+                )
+            except Exception:
+                logger.exception("Could not apply booster group-rank settings")
+                await reply(
+                    interaction,
+                    "I could not apply the booster group-rank settings. Check the bot logs and try again.",
+                )
+                return
+
+            await reply(
+                interaction,
+                "**Booster group-rank settings updated for this session.**\n"
+                f"Booster role: <@&{booster_role_id}>\n"
+                f"Username thread: {thread.mention}\n"
+                f"Booster rank channel: {booster_rank_channel.mention}\n"
+                f"Roleshift channel: {roleshift_channel.mention}\n\n"
+                "The defaults in `settings.py` will be applied again on the next restart.",
+            )
+
     class SettingsMenuView(discord.ui.View):
         def __init__(self) -> None:
             super().__init__(timeout=300)
@@ -630,6 +850,14 @@ def build_settings_command(
                     await reply(
                         interaction,
                         "You need the forum manager role to use forum settings.",
+                    )
+                    return False
+            elif section == "group_rank":
+                if not can_manage_group_rank(interaction.user):
+                    await reply(
+                        interaction,
+                        "You need the configured main staff role or bot owner access "
+                        "to use booster group-rank settings.",
                     )
                     return False
             elif not can_use_general_settings(interaction.user):
@@ -678,6 +906,19 @@ def build_settings_command(
         ) -> None:
             if await self._owner_only(interaction, section="booster"):
                 await interaction.response.send_modal(BoosterConfigModal())
+
+        @discord.ui.button(
+            label="Booster group rank",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        async def booster_group_rank(
+            self,
+            interaction: discord.Interaction,
+            button: discord.ui.Button,
+        ) -> None:
+            if await self._owner_only(interaction, section="group_rank"):
+                await interaction.response.send_modal(BoosterGroupRankChannelsModal())
 
         @discord.ui.button(
             label="Creation approval",
