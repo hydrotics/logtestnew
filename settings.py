@@ -25,31 +25,31 @@ DEFAULT_EMBED_COLOUR = 0x242429
 # Keep 0 for an unset/disabled option.
 DEFAULT_SETTINGS: dict[str, dict[str, int | bool | str]] = {
     "main": {
-        "staff_role_id": 0,
+        "staff_role_id": 1272262536905101402,
         "embed_colour": DEFAULT_EMBED_COLOUR,
     },
     "forum": {
-        "forum_channel_id": 0,
-        "target_role_id": 0,
-        "auto_create_enabled": False,
-        "guild_id": 0,
-        "forum_manager_role_id": 0,
+        "forum_channel_id": 1555950984297971792,
+        "target_role_id": 1272267950807580785,
+        "auto_create_enabled": True,
+        "guild_id": 1272260028337750047,
+        "forum_manager_role_id": 1272262114110603338,
     },
     "creation": {
-        "creation_prompt_channel_id": 0,
-        "creation_approve_channel_id": 0,
+        "creation_prompt_channel_id": 1272260719424831529,
+        "creation_approve_channel_id": 1561405702394749088,
     },
     "booster": {
-        "booster_role_id": 0,
-        "staff_team_role_id": 0,
-        "reveal_archive_channel_id": 0,
+        "booster_role_id": 1272262536905101402,
+        "staff_team_role_id": 1272262536905101402,
+        "reveal_archive_channel_id": 1561405506608701511,
     },
     # These are Discord/server settings. GROUP_ID and GROUP_ROLE remain in group_scan.py.
     "booster_group_rank": {
-        "booster_role_id": 1560413737578659840,
-        "username_thread_id": 1571124508184547328,
-        "booster_rank_channel_id": 1561794561930428536,
-        "roleshift_channel_id": 1561789572894036040,
+        "booster_role_id": 1272315425966784621,
+        "username_thread_id": 1276526692026028042,
+        "booster_rank_channel_id": 0,
+        "roleshift_channel_id": 0,
         "group_name": "Mythic Reliques",
         "roleshift_from": "Booster",
         "roleshift_to": "Player",
