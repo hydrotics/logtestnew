@@ -33,7 +33,13 @@ create_log_module.build_status_embed = _build_status_embed_with_global_colour
 from Forum_Commands.create_log_command import build_create_log_commands
 from Forum_Commands.creation_prompt_command import setup_creation_prompt
 from Forum_Commands.status_command import build_status_command
-from settings import build_settings_command
+from settings import DEFAULT_SETTINGS, build_settings_command
+from group_scan import (
+    apply_group_rank_settings,
+    get_group_rank_settings,
+    setup_booster_user_prompt,
+    setup_fetch_rank,
+)
 
 load_dotenv()
 
@@ -46,8 +52,8 @@ _default_data_dir = (
 )
 DATABASE_PATH = os.path.join(_default_data_dir, "bot_data.sqlite3")
 
-FORUM_CHANNEL_ID = 0
-DISCORD_GUILD_ID = 0
+FORUM_CHANNEL_ID = int(DEFAULT_SETTINGS["forum"]["forum_channel_id"])
+DISCORD_GUILD_ID = int(DEFAULT_SETTINGS["forum"]["guild_id"])
 CREATE_CONCURRENCY = 1
 
 try:
@@ -214,6 +220,16 @@ class LogBot(discord.Client):
             manager=log_manager,
             owner_id=BOT_OWNER_ID,
         )
+        fetch_rank_command = setup_fetch_rank(
+            self,
+            manager=log_manager,
+            owner_id=BOT_OWNER_ID,
+        )
+        booster_user_prompt_command = setup_booster_user_prompt(
+            self,
+            manager=log_manager,
+            owner_id=BOT_OWNER_ID,
+        )
         settings_command = build_settings_command(
             owner_id=BOT_OWNER_ID,
             manager=log_manager,
@@ -222,10 +238,14 @@ class LogBot(discord.Client):
             apply_creation_settings=apply_creation_settings,
             apply_booster_settings=apply_booster_settings,
             get_booster_settings=get_booster_settings,
+            apply_group_rank_settings=apply_group_rank_settings,
+            get_group_rank_settings=get_group_rank_settings,
         )
         forum_commands = (
             build_create_log_commands(manager=log_manager, owner_id=BOT_OWNER_ID),
             build_status_command(manager=log_manager, owner_id=BOT_OWNER_ID),
+            fetch_rank_command,
+            booster_user_prompt_command,
             creation_prompt_command,
             settings_command,
         )
@@ -398,64 +418,101 @@ database, DATABASE_PATH = _open_database(DATABASE_PATH)
 logger.info("Using SQLite database at %s", os.path.abspath(DATABASE_PATH))
 
 try:
-    saved_forum_id = int(database.get_setting("forum_channel_id") or "0")
-    saved_staff_role_id = int(database.get_setting("staff_role_id") or "0")
-    saved_forum_manager_role_id = int(
-        database.get_setting("forum_manager_role_id") or "0"
+    default_forum_id = int(DEFAULT_SETTINGS["forum"]["forum_channel_id"])
+    default_staff_role_id = int(DEFAULT_SETTINGS["main"]["staff_role_id"])
+    default_forum_manager_role_id = int(
+        DEFAULT_SETTINGS["forum"]["forum_manager_role_id"]
     )
-    saved_target_role_id = int(database.get_setting("target_role_id") or "0")
-    saved_guild_id = int(database.get_setting("guild_id") or "0")
-    saved_creation_prompt_channel_id = int(
-        database.get_setting("creation_prompt_channel_id") or "0"
+    default_target_role_id = int(DEFAULT_SETTINGS["forum"]["target_role_id"])
+    default_guild_id = int(DEFAULT_SETTINGS["forum"]["guild_id"])
+    default_creation_prompt_channel_id = int(
+        DEFAULT_SETTINGS["creation"]["creation_prompt_channel_id"]
     )
-    saved_creation_approve_channel_id = int(
-        database.get_setting("creation_approve_channel_id") or "0"
+    default_creation_approve_channel_id = int(
+        DEFAULT_SETTINGS["creation"]["creation_approve_channel_id"]
     )
-    saved_booster_role_id = int(database.get_setting("booster_role_id") or "0")
-    saved_staff_team_role_id = int(database.get_setting("staff_team_role_id") or "0")
-    saved_reveal_archive_channel_id = int(
-        database.get_setting("reveal_archive_channel_id") or "0"
+    default_booster_role_id = int(DEFAULT_SETTINGS["booster"]["booster_role_id"])
+    default_staff_team_role_id = int(
+        DEFAULT_SETTINGS["booster"]["staff_team_role_id"]
     )
-    saved_embed_colour_raw = database.get_setting("embed_colour") or "#242429"
-    if saved_embed_colour_raw.startswith("#"):
-        saved_embed_colour_raw = saved_embed_colour_raw[1:]
-    if len(saved_embed_colour_raw) != 6 or any(
+    default_reveal_archive_channel_id = int(
+        DEFAULT_SETTINGS["booster"]["reveal_archive_channel_id"]
+    )
+    default_group_rank_booster_role_id = int(
+        DEFAULT_SETTINGS["booster_group_rank"]["booster_role_id"]
+    )
+    default_group_rank_username_thread_id = int(
+        DEFAULT_SETTINGS["booster_group_rank"]["username_thread_id"]
+    )
+    default_group_rank_channel_id = int(
+        DEFAULT_SETTINGS["booster_group_rank"]["booster_rank_channel_id"]
+    )
+    default_roleshift_channel_id = int(
+        DEFAULT_SETTINGS["booster_group_rank"]["roleshift_channel_id"]
+    )
+    default_group_name = str(DEFAULT_SETTINGS["booster_group_rank"]["group_name"]).strip()
+    default_roleshift_from = str(
+        DEFAULT_SETTINGS["booster_group_rank"]["roleshift_from"]
+    ).strip()
+    default_roleshift_to = str(
+        DEFAULT_SETTINGS["booster_group_rank"]["roleshift_to"]
+    ).strip()
+    if not default_group_name or not default_roleshift_from or not default_roleshift_to:
+        raise ValueError("DEFAULT_SETTINGS booster_group_rank text values cannot be blank")
+    default_embed_colour_raw = f"{int(DEFAULT_SETTINGS['main']['embed_colour']):06x}"
+    default_auto_create_enabled = bool(
+        DEFAULT_SETTINGS["forum"]["auto_create_enabled"]
+    )
+    if default_embed_colour_raw.startswith("#"):
+        default_embed_colour_raw = default_embed_colour_raw[1:]
+    if len(default_embed_colour_raw) != 6 or any(
         character not in "0123456789abcdefABCDEF"
-        for character in saved_embed_colour_raw
+        for character in default_embed_colour_raw
     ):
-        raise ValueError("embed_colour must be a six-digit hexadecimal colour")
-    saved_embed_colour_value = int(saved_embed_colour_raw, 16)
-except ValueError as exc:
-    raise RuntimeError("Saved bot settings in SQLite are invalid.") from exc
+        raise ValueError("DEFAULT_SETTINGS main embed_colour must be a six-digit hex colour")
+    default_embed_colour_value = int(default_embed_colour_raw, 16)
+except (TypeError, ValueError) as exc:
+    raise RuntimeError("DEFAULT_SETTINGS contains an invalid setting value.") from exc
 
-os.environ["BOOSTER_ROLE_ID"] = str(saved_booster_role_id)
-os.environ["STAFF_TEAM_ROLE_ID"] = str(saved_staff_team_role_id)
-os.environ["REVEAL_ARCHIVE_CHANNEL_ID"] = str(saved_reveal_archive_channel_id)
+apply_group_rank_settings(
+    default_group_rank_booster_role_id,
+    default_group_rank_username_thread_id,
+    default_group_rank_channel_id,
+    default_roleshift_channel_id,
+    default_group_name,
+    default_roleshift_from,
+    default_roleshift_to,
+)
+
+os.environ["BOOSTER_ROLE_ID"] = str(default_booster_role_id)
+os.environ["STAFF_TEAM_ROLE_ID"] = str(default_staff_team_role_id)
+os.environ["REVEAL_ARCHIVE_CHANNEL_ID"] = str(default_reveal_archive_channel_id)
 
 from booster_commands import booster_reveal as booster
 
-FORUM_CHANNEL_ID = saved_forum_id or FORUM_CHANNEL_ID
+FORUM_CHANNEL_ID = default_forum_id
 forum_pacer.forum_channel_id = FORUM_CHANNEL_ID
 log_manager = LogManager(
     bot=bot,
     database=database,
-    role_id=saved_target_role_id,
+    role_id=default_target_role_id,
     forum_channel_id=FORUM_CHANNEL_ID,
     forum_pacer=forum_pacer,
     concurrency=CREATE_CONCURRENCY,
 )
-log_manager.staff_role_id = saved_staff_role_id
-log_manager.forum_manager_role_id = saved_forum_manager_role_id
-log_manager.embed_colour = discord.Colour(saved_embed_colour_value)
-log_manager.guild_id = saved_guild_id or DISCORD_GUILD_ID
-log_manager.creation_prompt_channel_id = saved_creation_prompt_channel_id
-log_manager.creation_approve_channel_id = saved_creation_approve_channel_id
+log_manager.staff_role_id = default_staff_role_id
+log_manager.forum_manager_role_id = default_forum_manager_role_id
+log_manager.embed_colour = discord.Colour(default_embed_colour_value)
+log_manager.guild_id = default_guild_id
+log_manager.creation_prompt_channel_id = default_creation_prompt_channel_id
+log_manager.creation_approve_channel_id = default_creation_approve_channel_id
+log_manager.set_auto_log(default_auto_create_enabled)
 
 booster.install(
     bot,
-    booster_role_id=saved_booster_role_id,
-    staff_team_role_id=saved_staff_team_role_id,
-    reveal_archive_channel_id=saved_reveal_archive_channel_id,
+    booster_role_id=default_booster_role_id,
+    staff_team_role_id=default_staff_team_role_id,
+    reveal_archive_channel_id=default_reveal_archive_channel_id,
     owner_id=BOT_OWNER_ID,
 )
 
@@ -466,8 +523,6 @@ def apply_main_settings(staff_role_id: int, embed_colour_value: int) -> None:
     if not 0 <= embed_colour_value <= 0xFFFFFF:
         raise ValueError("Embed colour must be between 0x000000 and 0xFFFFFF")
 
-    database.set_setting("staff_role_id", str(staff_role_id))
-    database.set_setting("embed_colour", f"#{embed_colour_value:06x}")
     log_manager.staff_role_id = staff_role_id
     log_manager.embed_colour = discord.Colour(embed_colour_value)
 
@@ -479,12 +534,7 @@ def apply_forum_settings(
     guild_id: int,
     forum_manager_role_id: int = 0,
 ) -> None:
-    database.set_setting("forum_manager_role_id", str(int(forum_manager_role_id)))
     log_manager.forum_manager_role_id = int(forum_manager_role_id)
-    database.set_setting("forum_channel_id", str(int(forum_channel_id)))
-    database.set_setting("target_role_id", str(int(target_role_id)))
-    database.set_setting("guild_id", str(int(guild_id)))
-
     log_manager.forum_channel_id = int(forum_channel_id)
     log_manager.role_id = int(target_role_id)
     log_manager.guild_id = int(guild_id)
@@ -496,8 +546,6 @@ def apply_forum_settings(
 
 
 def apply_creation_settings(prompt_channel_id: int, approve_channel_id: int) -> None:
-    database.set_setting("creation_prompt_channel_id", str(int(prompt_channel_id)))
-    database.set_setting("creation_approve_channel_id", str(int(approve_channel_id)))
     log_manager.creation_prompt_channel_id = int(prompt_channel_id)
     log_manager.creation_approve_channel_id = int(approve_channel_id)
 
@@ -515,11 +563,6 @@ def apply_booster_settings(
     staff_team_role_id: int,
     reveal_archive_channel_id: int,
 ) -> None:
-    database.set_setting("booster_role_id", str(int(booster_role_id)))
-    database.set_setting("staff_team_role_id", str(int(staff_team_role_id)))
-    database.set_setting(
-        "reveal_archive_channel_id", str(int(reveal_archive_channel_id))
-    )
     booster.update_config(
         booster_role_id=int(booster_role_id),
         staff_team_role_id=int(staff_team_role_id),
