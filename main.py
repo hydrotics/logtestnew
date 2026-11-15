@@ -33,7 +33,7 @@ create_log_module.build_status_embed = _build_status_embed_with_global_colour
 from Forum_Commands.create_log_command import build_create_log_commands
 from Forum_Commands.creation_prompt_command import setup_creation_prompt
 from Forum_Commands.status_command import build_status_command
-from settings import DEFAULT_SETTINGS, build_settings_command
+from settings import CONFIG, DEFAULT_SETTINGS, build_settings_command
 from group_scan import (
     apply_group_rank_settings,
     get_group_rank_settings,
@@ -45,16 +45,18 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
+_configured_data_dir = str(CONFIG["bot"]["database_directory"])
 _default_data_dir = (
-    "/var/data"
-    if os.path.isdir("/var/data")
+    _configured_data_dir
+    if _configured_data_dir and os.path.isdir(_configured_data_dir)
     else os.path.dirname(os.path.abspath(__file__))
 )
-DATABASE_PATH = os.path.join(_default_data_dir, "bot_data.sqlite3")
+DATABASE_PATH = os.path.join(_default_data_dir, str(CONFIG["bot"]["database_filename"]))
 
 FORUM_CHANNEL_ID = int(DEFAULT_SETTINGS["forum"]["forum_channel_id"])
 DISCORD_GUILD_ID = int(DEFAULT_SETTINGS["forum"]["guild_id"])
-CREATE_CONCURRENCY = 1
+CREATE_CONCURRENCY = int(CONFIG["bot"]["create_concurrency"])
+COMMAND_SYNC_ATTEMPTS = max(1, int(CONFIG["bot"]["command_sync_attempts"]))
 
 try:
     owner_id_value = os.getenv("BOT_OWNER_ID", "").strip()
@@ -79,7 +81,7 @@ intents = discord.Intents.default()
 intents.members = True
 
 
-FORUM_MANAGER_COMMANDS = {"create_log", "status"}
+FORUM_MANAGER_COMMANDS = {str(name) for name in CONFIG["bot"]["forum_manager_commands"]}
 
 
 class LogCommandTree(app_commands.CommandTree):
@@ -265,7 +267,7 @@ class LogBot(discord.Client):
         expected_names = {command.name for command in current_commands}
 
         last_error: Exception | None = None
-        for attempt in range(1, 4):
+        for attempt in range(1, COMMAND_SYNC_ATTEMPTS + 1):
             try:
                 previous_guild_id = int(
                     database.get_setting("command_sync_guild_id") or "0"
@@ -358,16 +360,21 @@ class LogBot(discord.Client):
             except Exception as exc:
                 last_error = exc
                 logger.warning(
-                    "Command setup attempt %d/3 failed: %s", attempt, exc
+                    "Command setup attempt %d/%d failed: %s",
+                    attempt,
+                    COMMAND_SYNC_ATTEMPTS,
+                    exc,
                 )
-                if attempt < 3:
+                if attempt < COMMAND_SYNC_ATTEMPTS:
                     await asyncio.sleep(float(2**attempt))
 
         self.command_setup_error = last_error or RuntimeError(
             "Unknown command setup failure."
         )
         logger.error(
-            "Command setup failed after 3 attempts: %s", self.command_setup_error
+            "Command setup failed after %d attempts: %s",
+            COMMAND_SYNC_ATTEMPTS,
+            self.command_setup_error,
         )
 
     async def close(self) -> None:
@@ -401,8 +408,8 @@ def _open_database(configured_path: str) -> tuple[Database, str]:
             raise
         logger.warning(
             "Cannot use DATABASE_PATH=%s (%s). Falling back to temporary SQLite "
-            "path %s. Configure DATABASE_PATH to a writable persistent disk to "
-            "keep data across restarts.",
+            "path %s. Configure bot.database_directory in config.json to a writable "
+            "persistent disk to keep data across restarts.",
             configured_path,
             exc,
             fallback_path,
@@ -458,7 +465,7 @@ try:
         DEFAULT_SETTINGS["booster_group_rank"]["roleshift_to"]
     ).strip()
     if not default_group_name or not default_roleshift_from or not default_roleshift_to:
-        raise ValueError("DEFAULT_SETTINGS booster_group_rank text values cannot be blank")
+        raise ValueError("config.json booster_group_rank text values cannot be blank")
     default_embed_colour_raw = f"{int(DEFAULT_SETTINGS['main']['embed_colour']):06x}"
     default_auto_create_enabled = bool(
         DEFAULT_SETTINGS["forum"]["auto_create_enabled"]
@@ -469,10 +476,10 @@ try:
         character not in "0123456789abcdefABCDEF"
         for character in default_embed_colour_raw
     ):
-        raise ValueError("DEFAULT_SETTINGS main embed_colour must be a six-digit hex colour")
+        raise ValueError("config.json main embed_colour must be a six-digit hex colour")
     default_embed_colour_value = int(default_embed_colour_raw, 16)
 except (TypeError, ValueError) as exc:
-    raise RuntimeError("DEFAULT_SETTINGS contains an invalid setting value.") from exc
+    raise RuntimeError("config.json contains an invalid setting value.") from exc
 
 apply_group_rank_settings(
     default_group_rank_booster_role_id,
