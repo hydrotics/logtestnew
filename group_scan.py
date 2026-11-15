@@ -1412,7 +1412,7 @@ def setup_booster_user_prompt(
     class RankRequestModal(discord.ui.Modal, title="Request your booster rank"):
         username = discord.ui.Label(
             text="Roblox username",
-            description="Letters, numbers and underscores only. No spaces.",
+            description="Only users in the group will be accepted for approval.",
             component=discord.ui.TextInput(
                 style=discord.TextStyle.short,
                 min_length=MIN_USERNAME_LENGTH,
@@ -1530,8 +1530,8 @@ def setup_booster_user_prompt(
         return discord.Embed(
             title=PROMPT_TITLE,
             description=(
-                "Boosting the server? Click the button below and enter your Roblox "
-                "username to request your booster rank in the group. Staff will review it."
+                "Click the button below and enter your Roblox "
+                "username to request your booster rank in the group. You will receive a DM or mention in the thread once ranked."
             ),
             colour=configured_colour(manager),
         )
