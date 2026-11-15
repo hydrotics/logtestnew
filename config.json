@@ -1,0 +1,86 @@
+{
+  "_readme": [
+    "Every setting lives under \"defaults\". These values are loaded each time the bot starts.",
+    "Changes made with /settings only last until the next restart (Render free tier does not keep files), so edit this file to change the startup values.",
+    "Colours are hex strings like \"#242429\". IDs are plain numbers. 0 = not set.",
+    "Keys starting with an underscore are ignored."
+  ],
+  "defaults": {
+    "bot": {
+      "create_concurrency": 1,
+      "forum_manager_commands": [
+        "create_log",
+        "status"
+      ],
+      "command_sync_attempts": 3,
+      "database_directory": "/var/data",
+      "database_filename": "bot_data.sqlite3",
+      "ui_timeout_seconds": 300
+    },
+    "main": {
+      "staff_role_id": 1272262536905101402,
+      "embed_colour": "#242429"
+    },
+    "forum": {
+      "forum_channel_id": 1555950984297971792,
+      "target_role_id": 1272267950807580785,
+      "auto_create_enabled": true,
+      "guild_id": 1272260028337750047,
+      "forum_manager_role_id": 1272262114110603338
+    },
+    "creation": {
+      "creation_prompt_channel_id": 1272260719424831529,
+      "creation_approve_channel_id": 1561405702394749088
+    },
+    "booster": {
+      "booster_role_id": 1272262536905101402,
+      "staff_team_role_id": 1272262536905101402,
+      "reveal_archive_channel_id": 1561405506608701511
+    },
+    "booster_group_rank": {
+      "booster_role_id": 1272315425966784621,
+      "username_thread_id": 1276526692026028042,
+      "booster_rank_channel_id": 1571488779896627280,
+      "roleshift_channel_id": 1354041307500380172,
+      "group_name": "Mythic Reliques",
+      "roleshift_from": "Booster",
+      "roleshift_to": "Player"
+    },
+    "roblox_group": {
+      "group_id": 33955777,
+      "group_role": 107818007
+    },
+    "roblox_api": {
+      "groups_url": "https://groups.roblox.com",
+      "users_url": "https://users.roblox.com",
+      "thumbnails_url": "https://thumbnails.roblox.com",
+      "page_size": 100,
+      "max_pages": 200,
+      "max_retries": 5,
+      "request_timeout_seconds": 20
+    },
+    "rank_requests": {
+      "min_username_length": 5,
+      "max_username_length": 20,
+      "max_file_bytes": 2097152,
+      "submit_cooldown_seconds": 60
+    },
+    "derank_check": {
+      "booster_cache_ttl_seconds": 120,
+      "booster_cache_min_refresh_seconds": 10,
+      "window_ttl_seconds": 7200,
+      "window_max": 20,
+      "watch_interval_seconds": 60,
+      "watch_duration_seconds": 840,
+      "ranked_history_limit": 2000,
+      "list_field_limit": 1000,
+      "max_list_fields": 3
+    },
+    "colours": {
+      "fallback_embed": "#242429",
+      "accepted": "#2ECC71",
+      "denied": "#E74C3C",
+      "deranked": "#95A5A6"
+    }
+  }
+}
