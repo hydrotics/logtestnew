@@ -15,30 +15,30 @@
       "ui_timeout_seconds": 300
     },
     "main": {
-      "staff_role_id": 1555962486660796426,
+      "staff_role_id": 1272262536905101402,
       "embed_colour": "#242429"
     },
     "forum": {
-      "forum_channel_id": 1558518739711033364,
-      "target_role_id": 1555962486660796426,
-      "auto_create_enabled": false,
-      "guild_id": 1554933542474088478,
-      "forum_manager_role_id": 1555962486660796426
+      "forum_channel_id": 1555950984297971792,
+      "target_role_id": 1272267950807580785,
+      "auto_create_enabled": true,
+      "guild_id": 1272260028337750047,
+      "forum_manager_role_id": 1272262114110603338
     },
     "creation": {
-      "creation_prompt_channel_id": 1571480683506049054,
-      "creation_approve_channel_id": 1571480709040967740
+      "creation_prompt_channel_id": 1272260719424831529,
+      "creation_approve_channel_id": 1561405702394749088
     },
     "booster": {
-      "booster_role_id": 1555962486660796426,
-      "staff_team_role_id": 1555962486660796426,
-      "reveal_archive_channel_id": 0
+      "booster_role_id": 1272262536905101402,
+      "staff_team_role_id": 1272262536905101402,
+      "reveal_archive_channel_id": 1561405506608701511
     },
     "booster_group_rank": {
-      "booster_role_id": 1555962486660796426,
-      "username_thread_id": 0,
-      "booster_rank_channel_id": 0,
-      "roleshift_channel_id": 0,
+      "booster_role_id": 1272315425966784621,
+      "username_thread_id": 1276526692026028042,
+      "booster_rank_channel_id": 1571488779896627280,
+      "roleshift_channel_id": 1354041307500380172,
       "group_name": "Mythic Reliques",
       "roleshift_from": "Booster",
       "roleshift_to": "Player"
