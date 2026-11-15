@@ -11,12 +11,18 @@ import aiohttp
 import discord
 from discord import app_commands
 
-from settings import is_main_staff_or_owner
+from settings import CONFIG, is_main_staff_or_owner
 
 logger = logging.getLogger("discord-log-bot.group_scan")
 
-GROUP_ID = 33955777
-GROUP_ROLE: str | int | list[str | int] = 107818007
+_ROBLOX_GROUP = CONFIG["roblox_group"]
+_ROBLOX_API = CONFIG["roblox_api"]
+_RANK_REQUESTS = CONFIG["rank_requests"]
+_DERANK = CONFIG["derank_check"]
+_COLOURS = CONFIG["colours"]
+
+GROUP_ID = int(_ROBLOX_GROUP["group_id"])
+GROUP_ROLE: str | int | list[str | int] = _ROBLOX_GROUP["group_role"]
 
 def get_group_rank_settings() -> tuple[int, int, int, int, str, str, str]:
     return (
@@ -62,39 +68,49 @@ def apply_group_rank_settings(
     GROUP_NAME, ROLESHIFT_FROM, ROLESHIFT_TO = labels
 
 
-MIN_USERNAME_LENGTH = 5
-MAX_USERNAME_LENGTH = 20
-MAX_FILE_BYTES = 2 * 1024 * 1024
-ROBLOX_PAGE_SIZE = 100
-ROBLOX_MAX_PAGES = 200
-ROBLOX_MAX_RETRIES = 5
-BOOSTER_CACHE_TTL = 120.0
-BOOSTER_CACHE_MIN_REFRESH = 10.0
-WINDOW_TTL = 7200.0  # seconds a /fetch_rank list can still be used for logging
-WINDOW_MAX = 20  # lists kept in memory at once
-WATCH_INTERVAL = 60.0  # seconds between checks for newly deranked users
-WATCH_DURATION = 14 * 60.0  # the ephemeral message can only be edited for ~15 minutes
-SUBMIT_COOLDOWN = 60.0  # seconds between rank requests from the same user
-RANKED_HISTORY_LIMIT = 2000
-LIST_FIELD_LIMIT = 1000
-MAX_LIST_FIELDS = 3
+_RANK_DEFAULTS = CONFIG["booster_group_rank"]
+apply_group_rank_settings(
+    int(_RANK_DEFAULTS["booster_role_id"]),
+    int(_RANK_DEFAULTS["username_thread_id"]),
+    int(_RANK_DEFAULTS["booster_rank_channel_id"]),
+    int(_RANK_DEFAULTS["roleshift_channel_id"]),
+    str(_RANK_DEFAULTS["group_name"]),
+    str(_RANK_DEFAULTS["roleshift_from"]),
+    str(_RANK_DEFAULTS["roleshift_to"]),
+)
 
-ROBLOX_GROUPS_API = "https://groups.roblox.com"
-ROBLOX_USERS_API = "https://users.roblox.com"
-ROBLOX_THUMBNAILS_API = "https://thumbnails.roblox.com"
+MIN_USERNAME_LENGTH = int(_RANK_REQUESTS["min_username_length"])
+MAX_USERNAME_LENGTH = int(_RANK_REQUESTS["max_username_length"])
+MAX_FILE_BYTES = int(_RANK_REQUESTS["max_file_bytes"])
+SUBMIT_COOLDOWN = float(_RANK_REQUESTS["submit_cooldown_seconds"])  # seconds between rank requests from the same user
 
-DEFAULT_EMBED_COLOUR = discord.Colour.from_rgb(36, 36, 41)
-ACCEPTED_COLOUR = discord.Colour.from_rgb(46, 204, 113)
-DENIED_COLOUR = discord.Colour.from_rgb(231, 76, 60)
-DERANKED_COLOUR = discord.Colour.from_rgb(149, 165, 166)
+ROBLOX_PAGE_SIZE = int(_ROBLOX_API["page_size"])
+ROBLOX_MAX_PAGES = int(_ROBLOX_API["max_pages"])
+ROBLOX_MAX_RETRIES = int(_ROBLOX_API["max_retries"])
+
+BOOSTER_CACHE_TTL = float(_DERANK["booster_cache_ttl_seconds"])
+BOOSTER_CACHE_MIN_REFRESH = float(_DERANK["booster_cache_min_refresh_seconds"])
+WINDOW_TTL = float(_DERANK["window_ttl_seconds"])  # seconds a /fetch_rank list can still be used for logging
+WINDOW_MAX = int(_DERANK["window_max"])  # lists kept in memory at once
+WATCH_INTERVAL = float(_DERANK["watch_interval_seconds"])  # seconds between checks for newly deranked users
+WATCH_DURATION = float(_DERANK["watch_duration_seconds"])  # the ephemeral message can only be edited for ~15 minutes
+RANKED_HISTORY_LIMIT = int(_DERANK["ranked_history_limit"])
+LIST_FIELD_LIMIT = int(_DERANK["list_field_limit"])
+MAX_LIST_FIELDS = int(_DERANK["max_list_fields"])
+
+ROBLOX_GROUPS_API = str(_ROBLOX_API["groups_url"])
+ROBLOX_USERS_API = str(_ROBLOX_API["users_url"])
+ROBLOX_THUMBNAILS_API = str(_ROBLOX_API["thumbnails_url"])
+
+DEFAULT_EMBED_COLOUR = discord.Colour(int(_COLOURS["fallback_embed"]))
+ACCEPTED_COLOUR = discord.Colour(int(_COLOURS["accepted"]))
+DENIED_COLOUR = discord.Colour(int(_COLOURS["denied"]))
+DERANKED_COLOUR = discord.Colour(int(_COLOURS["deranked"]))
 
 PROMPT_TITLE = "Booster Rank Request"
 REQUEST_BUTTON_ID = "booster:request"
 RANK_BUTTON_ID = "booster:rank"
 
-# The approval message in BOOSTER_RANK is the only record of a request. Its status line moves
-# through: Not ranked -> Accepted -> Deranked (once its roleshift has been logged).
-# "Pending derank" is read as Accepted (older versions of this bot wrote it).
 STATUS_ACCEPTED = "**Status:** Accepted"
 STATUS_PENDING = "**Status:** Pending derank"
 STATUS_DERANKED = "**Status:** Deranked"
@@ -194,7 +210,9 @@ async def _roblox_request(
 
 
 def _new_session() -> aiohttp.ClientSession:
-    return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+    return aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=float(_ROBLOX_API["request_timeout_seconds"]))
+    )
 
 
 def wanted_roles() -> set[str]:
@@ -826,7 +844,7 @@ def setup_fetch_rank(
             if not ROLESHIFT_CHANNEL:
                 await reply(
                     interaction,
-                    "Set the roleshift channel in `DEFAULT_SETTINGS` (`settings.py`) first.",
+                    "Set the roleshift channel in `config.json` (`booster_group_rank`) first.",
                 )
                 return
             if roleshift_lock.locked():
@@ -1152,8 +1170,8 @@ def setup_fetch_rank(
         if not (GROUP_ID and wanted_roles() and BOOSTER_ID):
             await reply(
                 interaction,
-                "Set `GROUP_ID` and `GROUP_ROLE` in `group_scan.py`, and the booster role in "
-                "`DEFAULT_SETTINGS` (`settings.py`), first.",
+                "Set `roblox_group.group_id` and `roblox_group.group_role`, and the booster role "
+                "under `booster_group_rank`, in `config.json` first.",
             )
             return
         if guild.get_role(BOOSTER_ID) is None:
@@ -1580,8 +1598,8 @@ def setup_booster_user_prompt(
         if not (BOOSTER_BUTTON_THREAD and BOOSTER_RANK):
             await reply(
                 interaction,
-                "Set the username thread and booster rank channel in `DEFAULT_SETTINGS` "
-                "(`settings.py`) first.",
+                "Set the username thread and booster rank channel under "
+                "`booster_group_rank` in `config.json` first.",
             )
             return
         if text_channel(guild, BOOSTER_RANK) is None:
