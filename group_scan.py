@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import aiohttp
@@ -82,6 +82,7 @@ apply_group_rank_settings(
 MIN_USERNAME_LENGTH = int(_RANK_REQUESTS["min_username_length"])
 MAX_USERNAME_LENGTH = int(_RANK_REQUESTS["max_username_length"])
 MAX_FILE_BYTES = int(_RANK_REQUESTS["max_file_bytes"])
+LEGACY_USERS_FILE = str(_RANK_REQUESTS["legacy_users_file"]).strip()
 SUBMIT_COOLDOWN = float(_RANK_REQUESTS["submit_cooldown_seconds"])  # seconds between rank requests from the same user
 
 ROBLOX_PAGE_SIZE = int(_ROBLOX_API["page_size"])
@@ -110,10 +111,14 @@ DERANKED_COLOUR = discord.Colour(int(_COLOURS["deranked"]))
 PROMPT_TITLE = "Booster Rank Request"
 REQUEST_BUTTON_ID = "booster:request"
 RANK_BUTTON_ID = "booster:rank"
+DERANK_BUTTON_ID = "booster:derank"
+
+NOTIFY_CHANNEL = 1272268411145289831
 
 STATUS_ACCEPTED = "**Status:** Accepted"
 STATUS_PENDING = "**Status:** Pending derank"
 STATUS_DERANKED = "**Status:** Deranked"
+STATUS_WAITING = "**Status:** Waiting for derank"
 
 _ID_RE = re.compile(r"<@!?(\d{17,20})>|(?<![\d&#:])(\d{17,20})(?!\d)")
 _TOKEN_RE = re.compile(r"<(?:@&\d+|#\d+|a?:\w+:\d+|t:\d+(?::[a-zA-Z])?)>")
@@ -288,12 +293,15 @@ async def fetch_headshot(session: aiohttp.ClientSession, user_id: int) -> str | 
     return None
 
 
-_booster_cache: dict[str, Any] = {"ids": frozenset(), "at": float("-inf")}
+_booster_cache: dict[str, Any] = {"ids": frozenset(), "names": {}, "at": float("-inf")}
 _booster_lock = asyncio.Lock()
 
 
 def store_booster_cache(users: list[dict[str, Any]]) -> None:
     _booster_cache["ids"] = frozenset(int(u.get("userId", 0)) for u in users)
+    _booster_cache["names"] = {
+        int(u.get("userId", 0)): str(u.get("name") or u.get("username") or "") for u in users
+    }
     _booster_cache["at"] = time.monotonic()
 
 
@@ -378,7 +386,10 @@ class DerankScan(NamedTuple):
     still_boosting: int
     cleared: int
     to_derank: list[Candidate]
-    truncated: bool
+    manual: list[tuple[str, int]]  # users file entries with no Discord ID above the name
+    from_requests: int
+    from_file: int
+    notes: list[str]
 
 
 class Window:
@@ -541,6 +552,28 @@ class ReviewChannelUnavailable(Exception):
     pass
 
 
+def read_legacy_users() -> tuple[str, str | None]:
+    """Read the users file (old boosters from the thread). Returns (text, note) where note
+    explains why the file couldn't be used. Blocking, so call it with asyncio.to_thread."""
+    if not LEGACY_USERS_FILE:
+        return "", None
+    path = Path(LEGACY_USERS_FILE)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return "", (
+                f"{path.name} is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB "
+                "and was skipped."
+            )
+        return path.read_text(encoding="utf-8-sig", errors="replace"), None
+    except FileNotFoundError:
+        return "", f"{path.name} wasn't found, so only button requests were checked."
+    except OSError:
+        logger.warning("Could not read the users file %s", path, exc_info=True)
+        return "", f"{path.name} couldn't be read."
+
+
 async def booster_ids(max_age: float) -> frozenset[int]:
     """Roblox user IDs currently in the booster role(s); reuses the cache if it is fresh."""
     async with _booster_lock:
@@ -561,6 +594,65 @@ async def deranked_now(
     return [c for c in items if c.roblox_id not in ids and not _is_boosting(guild, c.discord_id)]
 
 
+async def booster_roster(max_age: float) -> dict[int, str]:
+    """Roblox user ID -> username for everyone currently in the booster role(s); reuses the
+    cache if it is fresh."""
+    async with _booster_lock:
+        if time.monotonic() - _booster_cache["at"] >= max_age:
+            async with _new_session() as session:
+                _, users = await fetch_role_users(session)
+            store_booster_cache(users)
+        return dict(_booster_cache["names"])
+
+
+REQUESTS_CACHE_TTL = 30.0
+_requests_cache: dict[str, Any] = {
+    "at": float("-inf"),
+    "channel": 0,
+    "ranked": {},
+    "legacy": {},
+}
+
+
+async def cached_requests(
+    channel: discord.TextChannel, bot_id: int
+) -> tuple[dict[tuple[int, int], Tracked], dict[tuple[int, str], Tracked]]:
+    """read_ranked_requests with a short cache, so several boosters losing the role at once
+    don't each trigger a full history scan."""
+    if (
+        _requests_cache["channel"] == channel.id
+        and time.monotonic() - _requests_cache["at"] < REQUESTS_CACHE_TTL
+    ):
+        return _requests_cache["ranked"], _requests_cache["legacy"]
+    ranked, legacy, _ = await read_ranked_requests(channel, bot_id)
+    _requests_cache.update(
+        {"at": time.monotonic(), "channel": channel.id, "ranked": ranked, "legacy": legacy}
+    )
+    return ranked, legacy
+
+
+def install_member_update_hook(client: discord.Client, handler: Any) -> None:
+    """discord.Client only keeps one on_member_update handler, so wrap the existing one
+    instead of replacing it."""
+    previous = getattr(client, "on_member_update", None)
+
+    async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+        if previous is not None:
+            try:
+                await previous(before, after)
+            except Exception:
+                logger.exception("Existing on_member_update handler failed")
+        try:
+            await handler(before, after)
+        except Exception:
+            logger.exception("Booster derank notification failed")
+
+    client.event(on_member_update)
+
+
+# (discord_id, roblox_id) -> (channel_id, message_id) of a notification still waiting for a derank
+_notified: dict[tuple[int, int], tuple[int, int]] = {}
+_derank_busy: set[int] = set()
 _windows: dict[int, Window] = {}
 _watchers: dict[int, asyncio.Task] = {}
 
@@ -595,10 +687,25 @@ def setup_fetch_rank(
     async def collect_derank_data(guild: discord.Guild) -> DerankScan:
         await ensure_members_loaded(guild)
         review_channel = guild.get_channel(BOOSTER_RANK) if BOOSTER_RANK else None
-        if not isinstance(review_channel, discord.TextChannel):
-            raise ReviewChannelUnavailable
+        legacy_text, file_note = await asyncio.to_thread(read_legacy_users)
+        notes: list[str] = []
 
-        ranked, legacy, truncated = await read_ranked_requests(review_channel, bot_id())
+        if isinstance(review_channel, discord.TextChannel):
+            ranked, legacy, truncated = await read_ranked_requests(review_channel, bot_id())
+            if truncated:
+                notes.append(
+                    f"Only the newest {RANKED_HISTORY_LIMIT} review-channel messages were read; "
+                    "older requests aren't tracked."
+                )
+        else:
+            if not legacy_text:
+                raise ReviewChannelUnavailable
+            ranked, legacy = {}, {}
+            notes.append(
+                "The booster rank channel wasn't found, so only the users file was checked."
+            )
+        if file_note:
+            notes.append(file_note)
 
         async with _new_session() as session:
             _, users = await fetch_role_users(session)
@@ -619,16 +726,21 @@ def setup_fetch_rank(
             int(user.get("userId", 0)): str(user.get("name") or user.get("username") or "")
             for user in users
         }
+        role_lookup = {
+            name.lower(): (roblox_id, name) for roblox_id, name in booster_names.items() if name
+        }
         del users
 
         tracked_count = 0
         still_boosting = 0
         cleared = 0
+        listed_roblox: set[int] = set()
         to_derank: list[Candidate] = []
         for (discord_id, roblox_id), tracked in ranked.items():
             if tracked.state == "deranked":
                 continue
             tracked_count += 1
+            listed_roblox.add(roblox_id)
             if _is_boosting(guild, discord_id):
                 still_boosting += 1
             elif roblox_id in booster_names:
@@ -642,8 +754,48 @@ def setup_fetch_rank(
                 )
             else:
                 cleared += 1
+        from_requests = tracked_count
+
+        # Old boosters from the users file. Anyone already tracked through a button request
+        # is skipped here so they aren't counted twice.
+        manual: list[tuple[str, int]] = []
+        from_file = 0
+        if legacy_text:
+            found = scan_text(legacy_text, set(role_lookup))
+            for key in sorted(found):
+                roblox_id, roblox_name = role_lookup[key]
+                if roblox_id in listed_roblox:
+                    continue
+                from_file += 1
+                has_booster = False
+                candidate_id: int | None = None
+                for discord_id in found[key]:
+                    if discord_id is None:
+                        continue
+                    if _is_boosting(guild, discord_id):
+                        has_booster = True
+                    elif candidate_id is None:
+                        candidate_id = discord_id
+                if has_booster:
+                    still_boosting += 1
+                elif candidate_id is not None:
+                    to_derank.append(Candidate(candidate_id, roblox_id, roblox_name, None))
+                else:
+                    manual.append((roblox_name, roblox_id))
+        tracked_count += from_file
+
         to_derank.sort(key=lambda c: c.name.lower())
-        return DerankScan(tracked_count, still_boosting, cleared, to_derank, truncated)
+        manual.sort(key=lambda row: row[0].lower())
+        return DerankScan(
+            tracked_count,
+            still_boosting,
+            cleared,
+            to_derank,
+            manual,
+            from_requests,
+            from_file,
+            notes,
+        )
 
     async def mark_deranked(guild: discord.Guild, items: list[Candidate], staff_id: int) -> int:
         """Mark the approval messages Deranked. Returns how many couldn't be updated."""
@@ -675,6 +827,390 @@ def setup_fetch_rank(
         if channel.guild.id != guild.id:
             return None
         return channel
+
+    notify_lock = asyncio.Lock()
+    notify_warned: set[str] = set()
+
+    async def get_notify_channel(guild: discord.Guild) -> discord.abc.Messageable | None:
+        if not NOTIFY_CHANNEL:
+            return None
+        channel = guild.get_channel(NOTIFY_CHANNEL) or guild.get_thread(NOTIFY_CHANNEL)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(NOTIFY_CHANNEL)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return None
+        if channel.guild.id != guild.id:
+            return None
+        return channel
+
+    async def tracked_ranked_accounts(
+        guild: discord.Guild, discord_id: int
+    ) -> list[tuple[int, str, int]]:
+        """The member's tracked Roblox accounts (button requests and the users file) that are
+        still in the booster role. Returns (roblox_id, roblox_name, approval_message_id), where
+        the message ID is 0 for accounts that only come from the users file."""
+        roster = await booster_roster(30.0)
+        if not roster:
+            return []
+        by_name = {name.lower(): roblox_id for roblox_id, name in roster.items() if name}
+        found: dict[int, tuple[str, int]] = {}
+
+        review_channel = guild.get_channel(BOOSTER_RANK) if BOOSTER_RANK else None
+        if isinstance(review_channel, discord.TextChannel):
+            ranked, legacy = await cached_requests(review_channel, bot_id())
+            for (owner, roblox_id), tracked in ranked.items():
+                if owner == discord_id and tracked.state != "deranked" and roblox_id in roster:
+                    found[roblox_id] = (roster[roblox_id] or tracked.name, tracked.message_id)
+            for (owner, ref), tracked in legacy.items():
+                roblox_id = by_name.get(ref.lower())
+                if owner == discord_id and tracked.state != "deranked" and roblox_id is not None:
+                    found.setdefault(
+                        roblox_id, (roster[roblox_id] or tracked.name, tracked.message_id)
+                    )
+
+        legacy_text, _ = await asyncio.to_thread(read_legacy_users)
+        if legacy_text:
+            for key, owners in scan_text(legacy_text, set(by_name)).items():
+                if discord_id in owners:
+                    roblox_id = by_name[key]
+                    found.setdefault(roblox_id, (roster[roblox_id], 0))
+
+        return [
+            (roblox_id, name, approval_id)
+            for roblox_id, (name, approval_id) in sorted(
+                found.items(), key=lambda item: item[1][0].lower()
+            )
+        ]
+
+    def derank_view(
+        user_id: int, roblox_id: int, approval_id: int, *, disabled: bool = False
+    ) -> discord.ui.View:
+        view = discord.ui.View(timeout=None)
+        view.add_item(MarkDerankedButton(user_id, roblox_id, approval_id, disabled=disabled))
+        return view
+
+    async def close_notification(
+        key: tuple[int, int],
+        staff_id: int,
+        approval_id: int = 0,
+        fallback: discord.Message | None = None,
+    ) -> None:
+        """Mark a notification as deranked and disable its button. Uses the tracked message
+        when known, otherwise the message that was clicked."""
+        ref = _notified.pop(key, None)
+        message = fallback
+        if ref is not None:
+            try:
+                channel = client.get_channel(ref[0]) or await client.fetch_channel(ref[0])
+                message = await channel.fetch_message(ref[1])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+                message = fallback
+        if message is None or not message.embeds:
+            return
+        embed = message.embeds[0].copy()
+        timestamp = int(discord.utils.utcnow().timestamp())
+        set_status(embed, f"{STATUS_DERANKED} by <@{staff_id}> · <t:{timestamp}:R>")
+        embed.colour = DERANKED_COLOUR
+        try:
+            await message.edit(
+                embed=embed,
+                view=derank_view(key[0], key[1], approval_id, disabled=True),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.warning("Could not update derank notification %s", message.id, exc_info=True)
+
+    async def close_notifications(items: list[Candidate], staff_id: int) -> None:
+        """Called after roleshifts are logged elsewhere, so open notifications don't stay
+        'waiting' and can't be logged a second time."""
+        for item in items:
+            await close_notification(
+                (item.discord_id, item.roblox_id), staff_id, item.message_id or 0
+            )
+        for window in _windows.values():
+            window.items = [
+                c
+                for c in window.items
+                if (c.discord_id, c.roblox_id) not in {(i.discord_id, i.roblox_id) for i in items}
+            ]
+
+    class ConfirmDerankView(discord.ui.View):
+        def __init__(
+            self,
+            *,
+            message: discord.Message,
+            user_id: int,
+            roblox_id: int,
+            roblox_name: str,
+            approval_id: int,
+        ) -> None:
+            super().__init__(timeout=300)
+            self.message = message
+            self.user_id = user_id
+            self.roblox_id = roblox_id
+            self.roblox_name = roblox_name
+            self.approval_id = approval_id
+
+        @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+        async def yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+            if not is_staff(interaction.user):
+                await interaction.response.send_message(
+                    "You need the configured staff role to do this.", ephemeral=True
+                )
+                return
+            guild = interaction.guild
+            if guild is None:
+                await interaction.response.edit_message(
+                    content="Use this button inside the server.", view=None
+                )
+                return
+            if roleshift_lock.locked():
+                await interaction.response.edit_message(
+                    content="Roleshifts are already being processed. Please try again shortly.",
+                    view=None,
+                )
+                return
+
+            await interaction.response.defer()
+            none = discord.AllowedMentions.none()
+            async with roleshift_lock:
+                channel = await get_roleshift_channel(guild)
+                if channel is None:
+                    await interaction.edit_original_response(
+                        content="The configured roleshift channel wasn't found as a text channel in this server.",
+                        view=None,
+                    )
+                    return
+                candidate = Candidate(
+                    self.user_id, self.roblox_id, self.roblox_name, self.approval_id or None
+                )
+                try:
+                    items = await deranked_now(guild, [candidate], max_age=15.0)
+                except (RobloxError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    logger.warning("Roblox check failed before logging a roleshift", exc_info=True)
+                    await interaction.edit_original_response(
+                        content=f"Couldn't check Roblox right now ({exc}). Please try again.",
+                        view=None,
+                    )
+                    return
+                if not items:
+                    await interaction.edit_original_response(
+                        content="That member is no longer deranked, so nothing was logged.",
+                        view=None,
+                    )
+                    return
+
+                try:
+                    for content in pack_roleshift_messages(
+                        [(self.user_id, self.roblox_name)], interaction.user.id
+                    ):
+                        await channel.send(content, allowed_mentions=none)
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception("Could not send the roleshift log")
+                    await interaction.edit_original_response(
+                        content="I couldn't send the roleshift log. Check the roleshift channel before trying again.",
+                        view=None,
+                    )
+                    return
+
+                failed = await mark_deranked(guild, items, interaction.user.id)
+                await close_notification(
+                    (self.user_id, self.roblox_id),
+                    interaction.user.id,
+                    self.approval_id,
+                    fallback=self.message,
+                )
+                for window in _windows.values():
+                    window.items = [
+                        c
+                        for c in window.items
+                        if (c.discord_id, c.roblox_id) != (self.user_id, self.roblox_id)
+                    ]
+                note = "\nThe original request message couldn't be marked as deranked." if failed else ""
+                await interaction.edit_original_response(
+                    content=(
+                        f"Logged the roleshift for <@{self.user_id}> · `{self.roblox_name}` "
+                        f"in <#{ROLESHIFT_CHANNEL}>.{note}"
+                    ),
+                    view=None,
+                    allowed_mentions=none,
+                )
+
+        @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+        async def no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+            await interaction.response.edit_message(
+                content="Roleshift cancelled.", view=None
+            )
+
+    class MarkDerankedButton(
+        discord.ui.DynamicItem[discord.ui.Button],
+        template=(
+            rf"{DERANK_BUTTON_ID}:(?P<user_id>[0-9]+):(?P<roblox_id>[0-9]+):(?P<approval_id>[0-9]+)"
+        ),
+    ):
+        def __init__(
+            self, user_id: int, roblox_id: int, approval_id: int, *, disabled: bool = False
+        ) -> None:
+            super().__init__(
+                discord.ui.Button(
+                    label="Deranked" if disabled else "Mark as deranked",
+                    style=discord.ButtonStyle.success,
+                    custom_id=f"{DERANK_BUTTON_ID}:{user_id}:{roblox_id}:{approval_id}",
+                    disabled=disabled,
+                )
+            )
+            self.user_id = user_id
+            self.roblox_id = roblox_id
+            self.approval_id = approval_id
+
+        @classmethod
+        async def from_custom_id(
+            cls,
+            interaction: discord.Interaction,
+            item: discord.ui.Button,
+            match,
+            /,
+        ) -> MarkDerankedButton:
+            return cls(
+                int(match["user_id"]), int(match["roblox_id"]), int(match["approval_id"])
+            )
+
+        async def callback(self, interaction: discord.Interaction) -> None:
+            message = interaction.message
+            if message is None:
+                await reply(interaction, "I could not find this notification message.")
+                return
+            if not is_staff(interaction.user):
+                await reply(interaction, "You need the configured staff role to do this.")
+                return
+            guild = interaction.guild
+            if guild is None:
+                await reply(interaction, "Use this button inside the server.")
+                return
+            if message.id in _derank_busy:
+                await reply(interaction, "This notification is already being handled.")
+                return
+
+            _derank_busy.add(message.id)
+            try:
+                await self._review(interaction, message, guild)
+            finally:
+                _derank_busy.discard(message.id)
+
+        async def _review(
+            self,
+            interaction: discord.Interaction,
+            message: discord.Message,
+            guild: discord.Guild,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            none = discord.AllowedMentions.none()
+
+            embed = message.embeds[0] if message.embeds else None
+            if embed is not None and STATUS_DERANKED in (embed.description or ""):
+                await interaction.edit_original_response(
+                    content="This member is already marked as deranked."
+                )
+                return
+            roblox_name = (embed_roblox_name(embed) if embed else None) or str(self.roblox_id)
+
+            await ensure_members_loaded(guild)
+            if _is_boosting(guild, self.user_id):
+                await interaction.edit_original_response(
+                    content=f"<@{self.user_id}> has the booster role again, so they can't be deranked.",
+                    allowed_mentions=none,
+                )
+                return
+            try:
+                ids = await booster_ids(0.0)
+            except (RobloxError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning("Roblox check failed while preparing a derank", exc_info=True)
+                await interaction.edit_original_response(
+                    content=f"Couldn't check Roblox right now ({exc}). Please try again."
+                )
+                return
+            if self.roblox_id in ids:
+                await interaction.edit_original_response(
+                    content=(
+                        f"`{roblox_name}` is still ranked in the group. "
+                        "Derank them on Roblox first, then press the button again."
+                    )
+                )
+                return
+
+            await interaction.edit_original_response(
+                content=f"Generate roleshift for <@{self.user_id}> · `{roblox_name}`?",
+                view=ConfirmDerankView(
+                    message=message,
+                    user_id=self.user_id,
+                    roblox_id=self.roblox_id,
+                    roblox_name=roblox_name,
+                    approval_id=self.approval_id,
+                ),
+                allowed_mentions=none,
+            )
+
+    async def on_booster_role_lost(before: discord.Member, after: discord.Member) -> None:
+        if not (BOOSTER_ID and NOTIFY_CHANNEL) or after.bot:
+            return
+        if before.get_role(BOOSTER_ID) is None or after.get_role(BOOSTER_ID) is not None:
+            return
+
+        guild = after.guild
+        channel = await get_notify_channel(guild)
+        if channel is None:
+            if "channel" not in notify_warned:
+                notify_warned.add("channel")
+                logger.warning(
+                    "NOTIFY_CHANNEL %s wasn't found as a text channel or thread.", NOTIFY_CHANNEL
+                )
+            return
+
+        async with notify_lock:
+            try:
+                accounts = await tracked_ranked_accounts(guild, after.id)
+            except (RobloxError, aiohttp.ClientError, asyncio.TimeoutError, discord.HTTPException):
+                logger.warning(
+                    "Could not check %s for a booster derank notification", after.id, exc_info=True
+                )
+                return
+
+            for roblox_id, roblox_name, approval_id in accounts:
+                key = (after.id, roblox_id)
+                if key in _notified:
+                    continue
+                avatar_url: str | None = None
+                try:
+                    async with _new_session() as session:
+                        avatar_url = await fetch_headshot(session, roblox_id)
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+
+                embed = discord.Embed(
+                    description=(
+                        f"## {after.mention} · `{roblox_name}` · [Profile]({profile_url(roblox_id)})\n"
+                        f"{STATUS_WAITING}"
+                    ),
+                    colour=configured_colour(manager),
+                )
+                embed.set_author(name=after.display_name, icon_url=after.display_avatar.url)
+                if avatar_url:
+                    embed.set_thumbnail(url=avatar_url)
+                try:
+                    sent = await channel.send(
+                        embed=embed,
+                        view=derank_view(after.id, roblox_id, approval_id),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    logger.warning(
+                        "Could not send a derank notification for %s", after.id, exc_info=True
+                    )
+                    continue
+                _notified[key] = (channel.id, sent.id)
 
     def window_embed(window: Window, ready: int) -> discord.Embed:
         embed = window.embed.copy()
@@ -777,6 +1313,7 @@ def setup_fetch_rank(
                     return
 
                 failed = await mark_deranked(guild, items, interaction.user.id)
+                await close_notifications(items, interaction.user.id)
                 logged = {(c.discord_id, c.roblox_id) for c in items}
                 window.items = [
                     c for c in window.items if (c.discord_id, c.roblox_id) not in logged
@@ -980,6 +1517,14 @@ def setup_fetch_rank(
         embed.add_field(name="Tracked", value=f"`{scan.tracked}`", inline=True)
         embed.add_field(name="Still boosting", value=f"`{scan.still_boosting}`", inline=True)
         embed.add_field(name="Already cleared", value=f"`{scan.cleared}`", inline=True)
+        embed.add_field(
+            name="Sources",
+            value=(
+                f"Approved users: `{scan.from_requests}`\n"
+                f"Old thread users: `{scan.from_file}`"
+            ),
+            inline=False,
+        )
 
         if scan.to_derank:
             rows = [
@@ -1000,163 +1545,27 @@ def setup_fetch_rank(
                     value=f"*+{len(rows) - shown} more, all included when logging.*",
                     inline=False,
                 )
-        if scan.truncated:
-            embed.set_footer(
-                text=(
-                    f"Only the newest {RANKED_HISTORY_LIMIT} review-channel messages were read; "
-                    "older requests aren't tracked."
-                )
-            )
-        await publish_window(interaction, guild, embed, scan.to_derank)
-
-    async def run_file_check(
-        interaction: discord.Interaction, guild: discord.Guild, thread_file: discord.Attachment
-    ) -> None:
-        filename = (thread_file.filename or "").lower()
-        if not (
-            filename.endswith(".txt") or (thread_file.content_type or "").startswith("text/plain")
-        ):
-            await reply(interaction, "Please attach a `.txt` file.")
-            return
-        if thread_file.size > MAX_FILE_BYTES:
-            await reply(
-                interaction,
-                f"That file is too large. The limit is {MAX_FILE_BYTES // (1024 * 1024)} MB.",
-            )
-            return
-        try:
-            raw = await thread_file.read()
-        except discord.HTTPException:
-            await reply(interaction, "I couldn't download that file. Please try again.")
-            return
-        text = raw.decode("utf-8-sig", errors="replace")
-        del raw
-
-        await ensure_members_loaded(guild)
-        try:
-            async with _new_session() as session:
-                roles, role_users = await fetch_role_users(session)
-                store_booster_cache(role_users)
-        except RobloxError as exc:
-            await reply(interaction, f"Roblox lookup failed: {exc}")
-            return
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            logger.exception("Roblox request failed")
-            await reply(interaction, "Couldn't reach Roblox. Please try again later.")
-            return
-
-        role_lookup: dict[str, tuple[int, str]] = {}
-        for entry in role_users:
-            username = str(entry.get("name") or entry.get("username") or "")
-            if username:
-                role_lookup[username.lower()] = (int(entry.get("userId", 0)), username)
-        del role_users
-
-        found = scan_text(text, set(role_lookup))
-        missing: list[tuple[str, int, int, bool]] = []
-        manual: list[tuple[str, int]] = []
-        verified = 0
-        for key in sorted(found):
-            roblox_id, roblox_name = role_lookup[key]
-            has_booster = False
-            candidate: tuple[int, bool] | None = None
-            for discord_id in found[key]:
-                if discord_id is None:
-                    continue
-                member = guild.get_member(discord_id)
-                if member is not None and member.get_role(BOOSTER_ID) is not None:
-                    has_booster = True
-                elif candidate is None:
-                    candidate = (discord_id, member is not None)
-            if has_booster:
-                verified += 1
-            elif candidate is not None:
-                missing.append((roblox_name, roblox_id, candidate[0], candidate[1]))
-            else:
-                manual.append((roblox_name, roblox_id))
-        missing.sort(key=lambda row: row[0].lower())
-        manual.sort(key=lambda row: row[0].lower())
-
-        description = (
-            f"**{len(missing)}** ranked user{'s' if len(missing) != 1 else ''} in "
-            f"`{thread_file.filename}` lack the booster role.\n"
-            "The **Log roleshifts** button unlocks once you've deranked someone."
-            if missing
-            else "Every ranked user found in the file has the booster role."
-        )
-        embed = discord.Embed(
-            title="Booster Rank Check",
-            description=description,
-            colour=DENIED_COLOUR if missing else ACCEPTED_COLOUR,
-        )
-        embed.add_field(name="Ranked in group", value=f"`{len(role_lookup)}`", inline=True)
-        embed.add_field(name="Found in file", value=f"`{len(found)}`", inline=True)
-        embed.add_field(name="Have booster role", value=f"`{verified}`", inline=True)
-
-        truncated = False
-        rows = [
-            f"`{i}.` **<@{d}>** · `{n}`" + ("" if ins else " · *not in server*")
-            for i, (n, r, d, ins) in enumerate(missing, 1)
-        ]
-        if rows:
-            chunks, shown = pack_lines(rows, LIST_FIELD_LIMIT, MAX_LIST_FIELDS)
-            truncated = shown < len(rows)
-            for position, chunk in enumerate(chunks):
-                embed.add_field(
-                    name=f"Missing the booster role ({len(missing)})" if position == 0 else "\u200b",
-                    value=chunk,
-                    inline=False,
-                )
-            if truncated:
-                embed.add_field(
-                    name="\u200b",
-                    value=f"*+{len(rows) - shown} more in the attached file.*",
-                    inline=False,
-                )
-        if manual:
-            manual_rows = [f"`{n}`" for n, r in manual]
+        if scan.manual:
+            manual_rows = [f"`{name}`" for name, _ in scan.manual]
             chunks, shown = pack_lines(manual_rows, LIST_FIELD_LIMIT, 1)
-            truncated = truncated or shown < len(manual_rows)
+            value = chunks[0]
+            if shown < len(manual_rows):
+                value += f"\n*+{len(manual_rows) - shown} more.*"
             embed.add_field(
-                name=f"No Discord ID above the name ({len(manual)})",
-                value=chunks[0],
+                name=f"No Discord ID above the name ({len(scan.manual)})",
+                value=value,
                 inline=False,
             )
-
-        extra: dict[str, Any] = {}
-        if truncated:
-            report = [
-                f"MISSING BOOSTER ROLE ({len(missing)}):",
-                *[
-                    f"<@{d}> · {n}" + ("" if ins else " | not in server")
-                    for n, r, d, ins in missing
-                ],
-                "",
-                f"NO DISCORD ID ({len(manual)}):",
-                *[n for n, r in manual],
-            ]
-            extra["file"] = discord.File(
-                io.BytesIO("\n".join(report).encode("utf-8")), filename="fetch_rank_results.txt"
-            )
-        await publish_window(
-            interaction,
-            guild,
-            embed,
-            [Candidate(d, r, n, None) for n, r, d, _ in missing],
-            **extra,
-        )
+        if scan.notes:
+            embed.set_footer(text=" · ".join(scan.notes)[:2048])
+        await publish_window(interaction, guild, embed, scan.to_derank)
 
     @app_commands.command(
         name="fetch_rank",
-        description="Find ranked boosters who need deranking (attach a .txt to check a file instead).",
-    )
-    @app_commands.describe(
-        thread_file="Optional .txt with a Discord user ID above each Roblox username. Leave empty to check button requests."
+        description="Find all ranked boosters who need deranking (button requests and the users file).",
     )
     @app_commands.guild_only()
-    async def fetch_rank(
-        interaction: discord.Interaction, thread_file: discord.Attachment | None = None
-    ) -> None:
+    async def fetch_rank(interaction: discord.Interaction) -> None:
         if not is_staff(interaction.user):
             await reply(
                 interaction,
@@ -1183,15 +1592,14 @@ def setup_fetch_rank(
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with lock:
-            if thread_file is None:
-                await run_derank_check(interaction, guild)
-            else:
-                await run_file_check(interaction, guild, thread_file)
+            await run_derank_check(interaction, guild)
 
     client_key = id(client)
     if client_key not in _registered_fetch_clients:
         # Lets a click on an older list reply "expired" instead of "interaction failed".
         client.add_view(RoleshiftView())
+        client.add_dynamic_items(MarkDerankedButton)
+        install_member_update_hook(client, on_booster_role_lost)
         _registered_fetch_clients.add(client_key)
 
     return fetch_rank
