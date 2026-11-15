@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Any, Callable
 
 import discord
@@ -16,44 +19,75 @@ ApplyBoosterSettings = Callable[[int, int, int], None]
 GetBoosterSettings = Callable[[], tuple[int, int, int]]
 ApplyGroupRankSettings = Callable[[int, int, int, int, str, str, str], None]
 GetGroupRankSettings = Callable[[], tuple[int, int, int, int, str, str, str]]
-DEFAULT_EMBED_COLOUR = 0x242429
 
-# These values are applied every time the bot starts and override any older
-# settings stored in SQLite. Changes made through /settings apply only until
-# the next restart, when these defaults are applied again.
-# Replace 0 with the relevant Discord role, channel or server ID.
-# Keep 0 for an unset/disabled option.
-DEFAULT_SETTINGS: dict[str, dict[str, int | bool | str]] = {
-    "main": {
-        "staff_role_id": 1272262536905101402,
-        "embed_colour": DEFAULT_EMBED_COLOUR,
-    },
-    "forum": {
-        "forum_channel_id": 1555950984297971792,
-        "target_role_id": 1272267950807580785,
-        "auto_create_enabled": True,
-        "guild_id": 1272260028337750047,
-        "forum_manager_role_id": 1272262114110603338,
-    },
-    "creation": {
-        "creation_prompt_channel_id": 1272260719424831529,
-        "creation_approve_channel_id": 1561405702394749088,
-    },
-    "booster": {
-        "booster_role_id": 1272262536905101402,
-        "staff_team_role_id": 1272262536905101402,
-        "reveal_archive_channel_id": 1561405506608701511,
-    },
-    # These are Discord/server settings. GROUP_ID and GROUP_ROLE remain in group_scan.py.
-    "booster_group_rank": {
-        "booster_role_id": 1272315425966784621,
-        "username_thread_id": 1276526692026028042,
-        "booster_rank_channel_id": 0,
-        "roleshift_channel_id": 1354041307500380172,
-        "group_name": "Mythic Reliques",
-        "roleshift_from": "Booster",
-        "roleshift_to": "Player",
-    },
+CONFIG_PATH = Path(
+    os.getenv("BOT_CONFIG_PATH") or Path(__file__).resolve().with_name("config.json")
+)
+_HEX_COLOUR_RE = re.compile(r"#?[0-9a-fA-F]{6}")
+_ANY_TYPE_KEYS = {("roblox_group", "group_role")}
+
+
+def _is_colour_key(section: str, key: str) -> bool:
+    return section == "colours" or key.endswith("_colour")
+
+
+def _check_value(section: str, key: str, value: Any) -> None:
+    """Raise a clear error for a value that can't be used."""
+    problem: str | None = None
+    if (section, key) in _ANY_TYPE_KEYS:
+        if isinstance(value, bool) or not isinstance(value, (str, int, list)):
+            problem = "must be a number, text, or a list"
+    elif _is_colour_key(section, key):
+        if not (isinstance(value, str) and _HEX_COLOUR_RE.fullmatch(value.strip())):
+            problem = 'must be a hex colour like "#242429"'
+    elif key.endswith("_id"):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            problem = "must be a whole number, 0 or higher"
+    elif key == "auto_create_enabled":
+        if not isinstance(value, bool):
+            problem = "must be true or false"
+    elif isinstance(value, bool) or not isinstance(value, (str, int, float, list)):
+        problem = "must be text, a number, or a list"
+    if problem:
+        raise RuntimeError(f"config.json defaults.{section}.{key} {problem} (got {value!r}).")
+
+
+def _load_config() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Config file not found: {CONFIG_PATH}") from exc
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not read {CONFIG_PATH}: {exc}") from exc
+
+    defaults = raw.get("defaults") if isinstance(raw, dict) else None
+    if not isinstance(defaults, dict):
+        raise RuntimeError(f'{CONFIG_PATH} needs a "defaults" section.')
+
+    merged: dict[str, dict[str, Any]] = {}
+    for section, values in defaults.items():
+        if section.startswith("_"):
+            continue
+        if not isinstance(values, dict):
+            raise RuntimeError(f"config.json defaults.{section} must be an object.")
+        merged[section] = {}
+        for key, value in values.items():
+            if key.startswith("_"):
+                continue
+            _check_value(section, key, value)
+            if _is_colour_key(section, key):
+                value = int(str(value).strip().lstrip("#"), 16)
+            merged[section][key] = value
+    return merged
+
+
+CONFIG = _load_config()
+UI_TIMEOUT = float(CONFIG["bot"]["ui_timeout_seconds"])
+DEFAULT_EMBED_COLOUR = int(CONFIG["colours"]["fallback_embed"])
+
+DEFAULT_SETTINGS = {
+    name: dict(CONFIG[name])
+    for name in ("main", "forum", "creation", "booster", "booster_group_rank")
 }
 
 
@@ -169,7 +203,7 @@ def build_settings_command(
         )
 
         def __init__(self) -> None:
-            super().__init__(timeout=300)
+            super().__init__(timeout=UI_TIMEOUT)
             self.staff_role.component.default_values = (
                 [discord.Object(id=manager.staff_role_id)]
                 if manager.staff_role_id
@@ -298,7 +332,7 @@ def build_settings_command(
         )
 
         def __init__(self) -> None:
-            super().__init__(timeout=300)
+            super().__init__(timeout=UI_TIMEOUT)
             self.forum_channel.component.default_values = (
                 [discord.Object(id=manager.forum_channel_id)]
                 if manager.forum_channel_id
@@ -455,7 +489,7 @@ def build_settings_command(
         )
 
         def __init__(self) -> None:
-            super().__init__(timeout=300)
+            super().__init__(timeout=UI_TIMEOUT)
             self.prompt_channel.component.default_values = (
                 [discord.Object(id=manager.creation_prompt_channel_id)]
                 if manager.creation_prompt_channel_id
@@ -559,7 +593,7 @@ def build_settings_command(
         )
 
         def __init__(self) -> None:
-            super().__init__(timeout=300)
+            super().__init__(timeout=UI_TIMEOUT)
             booster_role_id, staff_team_role_id, archive_channel_id = (
                 get_booster_settings()
             )
@@ -713,7 +747,7 @@ def build_settings_command(
         )
 
         def __init__(self) -> None:
-            super().__init__(timeout=300)
+            super().__init__(timeout=UI_TIMEOUT)
             (
                 booster_role_id,
                 username_thread_id,
@@ -871,12 +905,12 @@ def build_settings_command(
                 f"Username thread: {thread.mention}\n"
                 f"Booster rank channel: {booster_rank_channel.mention}\n"
                 f"Roleshift forum post: {roleshift_thread.mention}\n\n"
-                "The defaults in `settings.py` will be applied again on the next restart.",
+                "The values in `config.json` will be applied again on the next restart.",
             )
 
     class SettingsMenuView(discord.ui.View):
         def __init__(self) -> None:
-            super().__init__(timeout=300)
+            super().__init__(timeout=UI_TIMEOUT)
 
         async def _owner_only(
             self, interaction: discord.Interaction, section: str = "general"
