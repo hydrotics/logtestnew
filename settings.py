@@ -20,6 +20,11 @@ GetBoosterSettings = Callable[[], tuple[int, int, int]]
 ApplyGroupRankSettings = Callable[[int, int, int, int, str, str, str], None]
 GetGroupRankSettings = Callable[[], tuple[int, int, int, int, str, str, str]]
 
+# ---------------------------------------------------------------------------
+# config.json loader
+# Every setting lives under "defaults" in config.json and is loaded at startup.
+# /settings changes only live in memory until the next restart.
+# ---------------------------------------------------------------------------
 CONFIG_PATH = Path(
     os.getenv("BOT_CONFIG_PATH") or Path(__file__).resolve().with_name("config.json")
 )
