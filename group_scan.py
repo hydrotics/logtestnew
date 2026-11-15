@@ -1939,7 +1939,10 @@ def setup_booster_user_prompt(
             title=PROMPT_TITLE,
             description=(
                 "Click the button below and enter your Roblox "
-                "username to request your booster rank in the group. You will receive a DM or mention in the thread once ranked."
+                "username to request your booster rank in the group. "
+                "You will receive a DM or mention in the thread once ranked.\n"
+                "# Join Mythic Reliques group before requesting to be ranked\n"
+                "https://www.roblox.com/share/g/33955777"
             ),
             colour=configured_colour(manager),
         )
