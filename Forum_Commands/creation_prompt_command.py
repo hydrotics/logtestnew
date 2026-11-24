@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from types import MethodType
 from typing import Any
@@ -16,10 +17,33 @@ logger = logging.getLogger("discord-log-bot.creation")
 EMBED_COLOUR = discord.Colour.from_rgb(36, 36, 41)
 ACCEPTED_COLOUR = discord.Colour.from_rgb(46, 204, 113)
 DENIED_COLOUR = discord.Colour.from_rgb(231, 76, 60)
+PENDING_COLOUR = discord.Colour.from_rgb(241, 196, 15)
 PROMPT_SELECT_ID = "creation:prompt"
 REVIEW_SELECT_ID = "creation:review"
 MAX_TEXT_LENGTH = 1800
-MEDIA_TYPES = ("image/", "video/")
+MEDIA_TYPES = ("image/", "video/", "audio/")
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac",
+    ".flac", ".wma", ".weba", ".amr", ".aiff", ".aif",
+}
+
+# Pending submissions that wait longer than this are deleted and resent.
+PENDING_RESEND_AFTER = 24 * 60 * 60
+PENDING_CHECK_INTERVAL = 600
+PENDING_RETRY_DELAY = 3600
+PENDING_SCAN_LIMIT = 1000
+
+GUIDELINES_TEXT = (
+    "# Creation Guidelines\n"
+    "> You will not be punished for denied creations, unless it happens repeatedly\n"
+    "\n"
+    "1. You may only upload creations, nothing else\n"
+    "2. Creations must be fully owned & created by you\n"
+    "3. Do not upload creations made by or assisted by AI\n"
+    "4. The content of the creation must follow our server rules\n"
+    "5. Do not upload a creation which copies or traces another\n"
+    "  - E.g A suit idea which uses a suit template similar to ours"
+)
 
 
 def configured_embed_colour(manager: Any) -> discord.Colour:
@@ -31,6 +55,10 @@ _reviewing: set[int] = set()
 _registered_clients: set[int] = set()
 _prompt_messages: dict[int, int] = {}
 _prompt_locks: dict[int, asyncio.Lock] = {}
+# In-memory only: pending approval message ID -> unix time it becomes due.
+# Rebuilt from Discord on every boot; nothing is persisted.
+_pending: dict[int, float] = {}
+_background_tasks: set[asyncio.Task] = set()
 
 
 def setup_creation_prompt(
@@ -95,6 +123,21 @@ def setup_creation_prompt(
 
         used_filenames.add(candidate)
         return candidate
+
+    def is_visual_media(attachment: discord.Attachment) -> bool:
+        """True only for files a MediaGallery can actually render inline.
+
+        Audio (including audio-only containers such as .mp4/.webm recordings,
+        which Discord reports without width/height) is sent as a normal
+        attachment under the container so Discord shows a playable player.
+        """
+        extension = os.path.splitext((attachment.filename or "").lower())[1]
+        if extension in AUDIO_EXTENSIONS:
+            return False
+        content_type = (attachment.content_type or "").lower()
+        if not content_type.startswith(("image/", "video/")):
+            return False
+        return bool(attachment.width and attachment.height)
 
     def review_view(user_id: int, *, disabled: bool = False) -> discord.ui.View:
         view = discord.ui.View(timeout=None)
@@ -261,6 +304,8 @@ def setup_creation_prompt(
             source_embed = discord.Embed.from_dict(source_message.embeds[0].to_dict())
             attachments = list(source_message.attachments)
             media_files: list[discord.File] = []
+            media_visual: list[bool] = []
+            media_sources: list[tuple[str, str]] = []  # (temp path, filename)
             review_media_files: list[discord.File] = []
             dm_failed = False
             temporary_directory = tempfile.TemporaryDirectory(
@@ -291,6 +336,8 @@ def setup_creation_prompt(
                             media_files.append(
                                 discord.File(temporary_path, filename=filename)
                             )
+                            media_visual.append(is_visual_media(attachment))
+                            media_sources.append((temporary_path, filename))
                 elif not attachments:
                     # Recovery fallback for older submissions where only an
                     # embed image URL remains. Stream it to disk rather than
@@ -323,6 +370,8 @@ def setup_creation_prompt(
                             media_files.append(
                                 discord.File(temporary_path, filename=filename)
                             )
+                            media_visual.append(True)
+                            media_sources.append((temporary_path, filename))
 
                 if accepted:
                     channel = text_channel(
@@ -343,7 +392,7 @@ def setup_creation_prompt(
 
                     # Publish the accepted creation with Components V2. The
                     # layout is: username + mention beside avatar, divider,
-                    # every uploaded file, then the original submission text.
+                    # every image/video, then the original submission text.
                     description = source_embed.description or " "
                     submitter = (
                         interaction.guild.get_member(self.user_id)
@@ -388,13 +437,29 @@ def setup_creation_prompt(
                     published_container.add_item(
                         discord.ui.Separator(visible=True)
                     )
-                    # These uploads are validated as images/videos at submission
-                    # time, so a MediaGallery renders the actual media inline rather
-                    # than only showing a downloadable file card.
-                    media_gallery = discord.ui.MediaGallery()
-                    for uploaded_file in media_files:
-                        media_gallery.add_item(media=uploaded_file)
-                    published_container.add_item(media_gallery)
+                    # Images/videos render inline in a MediaGallery. Audio can't
+                    # be played inside a Components V2 container, so it is sent
+                    # as a normal attachment message right under the container.
+                    visual_files = [
+                        uploaded_file
+                        for uploaded_file, visual in zip(media_files, media_visual)
+                        if visual
+                    ]
+                    audio_originals = [
+                        uploaded_file
+                        for uploaded_file, visual in zip(media_files, media_visual)
+                        if not visual
+                    ]
+                    audio_sources = [
+                        source
+                        for source, visual in zip(media_sources, media_visual)
+                        if not visual
+                    ]
+                    if visual_files:
+                        media_gallery = discord.ui.MediaGallery()
+                        for uploaded_file in visual_files:
+                            media_gallery.add_item(media=uploaded_file)
+                        published_container.add_item(media_gallery)
                     published_container.add_item(
                         discord.ui.TextDisplay(description)
                     )
@@ -402,12 +467,31 @@ def setup_creation_prompt(
 
                     await channel.send(
                         view=published_view,
-                        files=media_files,
+                        files=visual_files,
                         allowed_mentions=discord.AllowedMentions(
                             users=[discord.Object(id=self.user_id)]
                         ),
                     )
-                    media_files = []  # discord.py has consumed/closed them
+
+                    # The audio objects were never sent; close them and open
+                    # fresh ones from the temp files for the playable message.
+                    for audio_original in audio_originals:
+                        audio_original.close()
+                    media_files = []  # discord.py has consumed/closed the rest
+
+                    if audio_sources:
+                        audio_files = [
+                            discord.File(path, filename=name)
+                            for path, name in audio_sources
+                        ]
+                        try:
+                            await channel.send(
+                                files=audio_files,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        finally:
+                            for audio_file in audio_files:
+                                audio_file.close()
 
                 # Keep the original review-channel attachments in place. If an
                 # older submission only has an embed image URL, replace it with
@@ -458,7 +542,8 @@ def setup_creation_prompt(
                             title="Creation Submission Denied",
                             description=(
                                 "Unfortunately, your creation submission has been "
-                                "**denied** by staff."
+                                "**denied** by staff. Please refer to our creation "
+                                "guidelines in the dropdown."
                             ),
                             colour=DENIED_COLOUR,
                             timestamp=discord.utils.utcnow(),
@@ -505,6 +590,9 @@ def setup_creation_prompt(
                     media_file.close()
                 temporary_directory.cleanup()
 
+            # Reviewed: stop tracking it for the 1-day resend.
+            _pending.pop(message.id, None)
+
             verdict = "accepted" if accepted else "denied"
             note = " (I couldn't DM the user.)" if (not accepted and dm_failed) else ""
             await interaction.followup.send(
@@ -543,7 +631,7 @@ def setup_creation_prompt(
                 names = ", ".join(invalid_attachments[:5])
                 await reply(
                     interaction,
-                    f"Please upload only images or videos. Unsupported file(s): {names}",
+                    f"Please upload only images, videos or audio. Unsupported file(s): {names}",
                 )
                 return
 
@@ -600,10 +688,13 @@ def setup_creation_prompt(
                     )
                     # Keep all media as normal message attachments, not embed images.
 
-                    await channel.send(
+                    sent_message = await channel.send(
                         embed=embed,
                         files=uploaded_files,
                         view=review_view(user.id),
+                    )
+                    _pending[sent_message.id] = (
+                        sent_message.created_at.timestamp() + PENDING_RESEND_AFTER
                     )
                 except (discord.HTTPException, OSError, aiohttp.ClientError, ValueError):
                     logger.exception(
@@ -622,6 +713,149 @@ def setup_creation_prompt(
                 interaction,
                 "Your creation has been submitted for staff approval.",
             )
+
+    # ------------------------------------------------------------------
+    # Pending submissions: resend after 1 day. State is kept in memory only
+    # and is rebuilt from Discord's own message history on every boot.
+    # ------------------------------------------------------------------
+    def pending_embed(message: discord.Message) -> discord.Embed | None:
+        if client.user is None or message.author.id != client.user.id:
+            return None
+        for embed in message.embeds:
+            for field in embed.fields:
+                if field.name == "Information" and "Pending review" in (field.value or ""):
+                    return embed
+        return None
+
+    async def resend_pending(
+        channel: discord.TextChannel,
+        message: discord.Message,
+    ) -> discord.Message | None:
+        source = pending_embed(message)
+        if source is None:
+            return None
+
+        embed = discord.Embed.from_dict(source.to_dict())
+        info_index = next(
+            (index for index, field in enumerate(embed.fields) if field.name == "Information"),
+            None,
+        )
+        if info_index is None:
+            return None
+        info_value = embed.fields[info_index].value or ""
+        match = re.search(r"<@!?(\d+)>", info_value)
+        if match is None:
+            logger.warning("Could not find submitter on pending message %s", message.id)
+            return None
+        user_id = int(match.group(1))
+
+        if "⚠️" not in info_value:
+            info_value = info_value.replace(
+                "**Status:** Pending review",
+                "**Status:** ⚠️ Pending review",
+            )
+        embed.set_field_at(info_index, name="Information", value=info_value, inline=False)
+        embed.colour = PENDING_COLOUR
+
+        new_message: discord.Message | None = None
+        with tempfile.TemporaryDirectory(prefix="creation-resend-") as temp_dir:
+            files: list[discord.File] = []
+            try:
+                used_filenames: set[str] = set()
+                async with aiohttp.ClientSession() as session:
+                    for index, attachment in enumerate(message.attachments):
+                        filename = unique_filename(
+                            attachment.filename or "upload",
+                            used_filenames,
+                        )
+                        temporary_path = os.path.join(temp_dir, f"attachment_{index}")
+                        await download_to_path(session, str(attachment.url), temporary_path)
+                        files.append(discord.File(temporary_path, filename=filename))
+
+                new_message = await channel.send(
+                    embed=embed,
+                    files=files,
+                    view=review_view(user_id),
+                )
+            finally:
+                for resend_file in files:
+                    resend_file.close()
+
+        # Send first, delete after, so a failed send never loses the submission.
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            logger.exception("Could not delete old pending submission %s", message.id)
+        return new_message
+
+    async def process_due_pending(
+        channel: discord.TextChannel,
+        cache: dict[int, discord.Message],
+    ) -> None:
+        now = discord.utils.utcnow().timestamp()
+        due_ids = sorted(
+            message_id for message_id, due in list(_pending.items()) if due <= now
+        )
+        for message_id in due_ids:
+            if message_id in _reviewing:
+                continue
+            message = cache.get(message_id)
+            if message is None:
+                try:
+                    message = await channel.fetch_message(message_id)
+                except discord.NotFound:
+                    _pending.pop(message_id, None)
+                    continue
+                except discord.HTTPException:
+                    continue
+            if pending_embed(message) is None:
+                _pending.pop(message_id, None)
+                continue
+
+            _reviewing.add(message_id)
+            try:
+                new_message = await resend_pending(channel, message)
+                _pending.pop(message_id, None)
+                if new_message is not None:
+                    _pending[new_message.id] = (
+                        new_message.created_at.timestamp() + PENDING_RESEND_AFTER
+                    )
+            except (discord.HTTPException, OSError, aiohttp.ClientError, ValueError):
+                logger.exception("Could not resend pending submission %s", message_id)
+                _pending[message_id] = now + PENDING_RETRY_DELAY
+            finally:
+                _reviewing.discard(message_id)
+            await asyncio.sleep(1)
+
+    async def pending_loop() -> None:
+        await client.wait_until_ready()
+        swept_channel_id = 0
+        while not client.is_closed():
+            try:
+                channel_id = int(manager.creation_approve_channel_id or 0)
+                channel = client.get_channel(channel_id) if channel_id else None
+                if isinstance(channel, discord.TextChannel):
+                    cache: dict[int, discord.Message] = {}
+                    if channel_id != swept_channel_id:
+                        # First run (boot) or channel changed: read pending
+                        # submissions straight from Discord's history.
+                        swept_channel_id = channel_id
+                        _pending.clear()
+                        async for old_message in channel.history(limit=PENDING_SCAN_LIMIT):
+                            if pending_embed(old_message) is None:
+                                continue
+                            cache[old_message.id] = old_message
+                            _pending[old_message.id] = (
+                                old_message.created_at.timestamp() + PENDING_RESEND_AFTER
+                            )
+                    await process_due_pending(channel, cache)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Pending creation check failed")
+            await asyncio.sleep(PENDING_CHECK_INTERVAL)
 
     def prompt_embed() -> discord.Embed:
         return discord.Embed(
@@ -739,7 +973,12 @@ def setup_creation_prompt(
                     label="Upload creation",
                     value="upload",
                     description="Submit your creation for staff approval.",
-                )
+                ),
+                discord.SelectOption(
+                    label="Creation Guidelines",
+                    value="guidelines",
+                    description="View the creation guidelines to see uploads which are not allowed & will get denied.",
+                ),
             ],
         )
         async def prompt(
@@ -747,7 +986,9 @@ def setup_creation_prompt(
             interaction: discord.Interaction,
             select: discord.ui.Select,
         ) -> None:
-            if text_channel(
+            if select.values and select.values[0] == "guidelines":
+                await reply(interaction, GUIDELINES_TEXT)
+            elif text_channel(
                 interaction.guild, manager.creation_approve_channel_id
             ) is None:
                 await reply(interaction, "Submissions are currently unavailable.")
@@ -815,6 +1056,11 @@ def setup_creation_prompt(
             await on_prompt_channel_message(message)
 
         client.on_message = MethodType(combined_on_message, client)
+
+        pending_task = asyncio.create_task(pending_loop())
+        _background_tasks.add(pending_task)
+        pending_task.add_done_callback(_background_tasks.discard)
+
         _registered_clients.add(client_key)
 
     return creation_prompt
