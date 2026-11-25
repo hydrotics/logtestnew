@@ -176,6 +176,7 @@ class LogBot(discord.Client):
             intents=intents,
             http_trace=forum_pacer.trace_config,
             max_ratelimit_timeout=None,
+            activity=discord.Game(name="Superstellar: Next Generation"),
         )
         self.tree = LogCommandTree(self)
         self.commands_ready = asyncio.Event()
