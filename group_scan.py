@@ -1635,6 +1635,18 @@ def embed_roblox_name(embed: discord.Embed) -> str | None:
     return None
 
 
+def _has_request_button(components: Any) -> bool:
+    """True if any component (including ones nested in containers/rows) is the
+    'Request rank' button. Lets the old embed prompt and the new Components V2
+    prompt both be recognised."""
+    for component in components or ():
+        if getattr(component, "custom_id", None) == REQUEST_BUTTON_ID:
+            return True
+        if _has_request_button(getattr(component, "children", ())):
+            return True
+    return False
+
+
 def setup_booster_user_prompt(
     client: discord.Client,
     *,
@@ -1655,10 +1667,12 @@ def setup_booster_user_prompt(
             await interaction.response.send_message(message, ephemeral=True)
 
     def lacks_booster_role(user: discord.User | discord.Member) -> bool:
+        # Main staff and the bot owner may always request a rank.
         return (
             bool(BOOSTER_ID)
             and isinstance(user, discord.Member)
             and user.get_role(BOOSTER_ID) is None
+            and not is_staff(user)
         )
 
     def rank_view(user_id: int, ref: str, *, disabled: bool = False) -> discord.ui.View:
@@ -1934,31 +1948,41 @@ def setup_booster_user_prompt(
 
             await reply(interaction, "Your rank request has been sent to staff.")
 
-    def prompt_embed() -> discord.Embed:
-        return discord.Embed(
-            title=PROMPT_TITLE,
-            description=(
-                "Click the button below and enter your Roblox "
-                "username to request your booster rank in the group. "
-                "You will receive a DM or mention in the thread once ranked.\n"
-                "# Join Mythic Reliques group before requesting to be ranked\n"
-                "https://www.roblox.com/share/g/33955777"
-            ),
-            colour=configured_colour(manager),
-        )
+    class PromptView(discord.ui.LayoutView):
+        """Components V2 prompt: heading, separators, instructions, group link, button."""
 
-    class PromptView(discord.ui.View):
         def __init__(self) -> None:
             super().__init__(timeout=None)
 
-        @discord.ui.button(
-            label="Request rank",
-            style=discord.ButtonStyle.primary,
-            custom_id=REQUEST_BUTTON_ID,
-        )
-        async def request_rank(
-            self, interaction: discord.Interaction, button: discord.ui.Button
-        ) -> None:
+            container = discord.ui.Container(accent_colour=configured_colour(manager))
+            container.add_item(discord.ui.TextDisplay(f"## {PROMPT_TITLE}"))
+            container.add_item(discord.ui.Separator(visible=True))
+            container.add_item(
+                discord.ui.TextDisplay(
+                    "Click the button below & enter your Roblox username to "
+                    "request the booster rank in the group.\n"
+                    "You will receive a DM or a mention in this thread once ranked."
+                )
+            )
+            container.add_item(discord.ui.Separator(visible=True))
+            container.add_item(
+                discord.ui.TextDisplay(
+                    "### Join the Mythic Reliques group before requesting\n"
+                    "> https://www.roblox.com/share/g/33955777"
+                )
+            )
+            container.add_item(discord.ui.Separator(visible=True))
+
+            button = discord.ui.Button(
+                label="Request rank",
+                style=discord.ButtonStyle.primary,
+                custom_id=REQUEST_BUTTON_ID,
+            )
+            button.callback = self.request_rank
+            container.add_item(discord.ui.ActionRow(button))
+            self.add_item(container)
+
+        async def request_rank(self, interaction: discord.Interaction) -> None:
             if text_channel(interaction.guild, BOOSTER_RANK) is None:
                 await reply(interaction, "Rank requests are currently unavailable.")
                 return
@@ -1983,7 +2007,10 @@ def setup_booster_user_prompt(
             async for old in thread.history(limit=50):
                 if client.user is None or old.author.id != client.user.id:
                     continue
-                if any(embed.title == PROMPT_TITLE for embed in old.embeds):
+                # Matches both the old embed prompt and the Components V2 prompt.
+                if any(
+                    embed.title == PROMPT_TITLE for embed in old.embeds
+                ) or _has_request_button(old.components):
                     _prompt_messages[thread.id] = old.id
                     return old
         except discord.HTTPException:
@@ -2036,7 +2063,7 @@ def setup_booster_user_prompt(
                     await old_prompt.delete()
                 except discord.NotFound:
                     pass
-            message = await thread.send(embed=prompt_embed(), view=PromptView())
+            message = await thread.send(view=PromptView())
             _prompt_messages[thread.id] = message.id
         except discord.HTTPException:
             logger.exception("Could not send booster prompt")
