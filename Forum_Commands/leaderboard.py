@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +9,6 @@ from typing import Any
 
 import discord
 from discord import app_commands
-from discord.http import Route
 
 import group_scan
 
@@ -20,9 +18,6 @@ TOP_N = 5
 
 # Fixed channel containing the booster derank logs.
 DERANK_CHANNEL_ID = 1272268411145289831
-
-# Discord message search returns a maximum of 25 results per request.
-DERANK_SEARCH_PAGE_SIZE = 25
 
 # A message is created BEFORE it is reviewed, so we look slightly further back than the
 # start of the month to catch submissions that were reviewed early this month.
@@ -67,17 +62,36 @@ def _month_bounds() -> tuple[datetime, datetime]:
 
 
 def _message_text(message: discord.Message) -> str:
-    """Collect searchable text from the message and all its embeds."""
+    """Collect searchable text from the bot's message and its embeds."""
     parts = [message.content or ""]
 
     for embed in message.embeds:
         parts.extend([
             embed.title or "",
             embed.description or "",
-            getattr(embed, "author", None).name
-            if getattr(embed, "author", None) else "",
-            getattr(embed, "footer", None).text
-            if getattr(embed, "footer", None) else "",
+            embed.author.name if embed.author else "",
+            embed.footer.text if embed.footer else "",
+        ])
+
+        for field in embed.fields:
+            parts.extend([
+                field.name or "",
+                field.value or "",
+            ])
+
+    return "\n".join(parts)
+
+
+def _embed_text(embeds: list[discord.Embed]) -> str:
+    """Collect text from embeds only, without inspecting message content."""
+    parts: list[str] = []
+
+    for embed in embeds:
+        parts.extend([
+            embed.title or "",
+            embed.description or "",
+            embed.author.name if embed.author else "",
+            embed.footer.text if embed.footer else "",
         ])
 
         for field in embed.fields:
@@ -136,11 +150,13 @@ async def _tally_reviews(
     total = 0
     start_ts = int(month_start.timestamp())
 
+    # Stream messages individually instead of building a list in memory.
     async for message in channel.history(
         limit=None,
         after=month_start - lookback,
         oldest_first=False,
     ):
+        # Only process messages authored by this bot.
         if message.author.id != bot_id or not message.embeds:
             continue
 
@@ -180,66 +196,30 @@ async def _tally_reviews(
     return counts, total
 
 
-def _get_derank_source(embeds: list[dict[str, Any]]) -> str | None:
-    """Get the first embed containing the derank marker.
-
-    This works with raw embed data returned by Discord's message-search API.
-    It deliberately does not inspect message content.
-    """
-    for embed in embeds:
-        parts = [
-            embed.get("title") or "",
-            embed.get("description") or "",
-        ]
-
-        for field in embed.get("fields", []):
-            parts.extend([
-                field.get("name") or "",
-                field.get("value") or "",
-            ])
-
-        author = embed.get("author") or {}
-        if author:
-            parts.append(author.get("name") or "")
-
-        footer = embed.get("footer") or {}
-        if footer:
-            parts.append(footer.get("text") or "")
-
-        embed_text = "\n".join(parts)
-
-        if _DERANK_RE.search(embed_text):
-            return embed_text
-
-    return None
-
-
 async def _tally_deranks(
-    channel: discord.abc.Messageable,
+    channel: discord.TextChannel | discord.Thread,
     bot_id: int,
     *,
     month_start: datetime,
-    http: Any,
 ) -> tuple[Counts, int]:
-    """Count deranks using Discord's filtered message-search endpoint.
+    """Count deranks from the bot's own embeds using normal channel history.
 
-    Discord filters the results BEFORE returning them:
-    - Exact derank channel
-    - Exact bot author
-    - Messages containing embeds
-    - Messages from the current month
+    This does NOT use Discord's message-search endpoint and does NOT require
+    the Message Content privileged intent.
 
-    This avoids downloading unrelated channel messages.
+    Messages are streamed one at a time. Other authors are skipped immediately.
+    Only embeds from messages authored by this bot are inspected.
 
-    Only the exact staff mention immediately following 'Deranked by'
-    receives credit. Unique target mentions before that marker are counted.
+    Discord still returns message objects from the channel history endpoint,
+    including metadata for other authors. Their content and embeds are not
+    inspected by this function.
     """
     counts: Counts = {}
     total = 0
 
     if getattr(channel, "id", None) != DERANK_CHANNEL_ID:
         logger.error(
-            "Derank search refused: expected channel %s, received channel %s",
+            "Derank scan refused: expected channel %s, received channel %s",
             DERANK_CHANNEL_ID,
             getattr(channel, "id", None),
         )
@@ -248,151 +228,51 @@ async def _tally_deranks(
     guild = getattr(channel, "guild", None)
 
     if guild is None:
-        logger.error("Derank search refused: channel has no guild.")
+        logger.error("Derank scan refused: channel has no guild.")
         return counts, total
 
-    route = Route(
-        "GET",
-        "/guilds/{guild_id}/messages/search",
-        guild_id=guild.id,
-    )
+    # Stream only this month's history. No message list is created.
+    async for message in channel.history(
+        limit=None,
+        after=month_start,
+        oldest_first=False,
+    ):
+        # Ignore other authors before inspecting any embed data.
+        if message.author.id != bot_id:
+            continue
 
-    # Discord snowflake corresponding to the beginning of this month.
-    min_message_id = discord.utils.time_snowflake(month_start)
+        if not message.embeds:
+            continue
 
-    # Search filters are applied by Discord, not after downloading messages.
-    base_params = [
-        ("limit", str(DERANK_SEARCH_PAGE_SIZE)),
-        ("min_id", str(min_message_id)),
-        ("channel_id", str(DERANK_CHANNEL_ID)),
-        ("author_id", str(bot_id)),
-        ("has", "embed"),
-        ("sort_by", "timestamp"),
-        ("sort_order", "desc"),
-    ]
+        # Only inspect embeds, never message content.
+        content = _embed_text(message.embeds)
 
-    before_id: str | None = None
+        if not content:
+            continue
 
-    while True:
-        params = list(base_params)
+        # Capture the exact staff mention after "Deranked by".
+        match = _DERANK_RE.search(content)
 
-        # Cursor pagination: request messages older than the previous page.
-        if before_id is not None:
-            params.append(("max_id", before_id))
+        if match is None:
+            continue
 
-        # Discord may return code 110000 while its search index is preparing.
-        data = None
+        staff_id = int(match.group(1))
 
-        for attempt in range(3):
-            data = await http.request(
-                route,
-                params=params,
-            )
+        # Only count target mentions before the staff marker.
+        target_text = content[:match.start()]
 
-            if not isinstance(data, dict) or data.get("code") != 110000:
-                break
+        # Deduplicate targets within this individual derank log.
+        deranked_members = set(
+            _MENTION_RE.findall(target_text)
+        )
 
-            retry_after = data.get("retry_after", 1)
+        entries = len(deranked_members)
 
-            try:
-                delay = min(max(float(retry_after), 0.25), 2.0)
-            except (TypeError, ValueError):
-                delay = 1.0
+        if entries == 0:
+            continue
 
-            if attempt < 2:
-                await asyncio.sleep(delay)
-
-        if not isinstance(data, dict):
-            raise RuntimeError(
-                "Discord returned an unexpected response from message search."
-            )
-
-        if data.get("code") == 110000:
-            raise RuntimeError(
-                "Discord's message-search index is not ready yet. "
-                "Please try the leaderboard again shortly."
-            )
-
-        # Discord returns messages as a nested array.
-        messages: list[dict[str, Any]] = []
-
-        for group in data.get("messages", []):
-            if isinstance(group, list):
-                messages.extend(
-                    item for item in group
-                    if isinstance(item, dict)
-                )
-            elif isinstance(group, dict):
-                messages.append(group)
-
-        if not messages:
-            break
-
-        oldest_message_id: int | None = None
-
-        for message_data in messages:
-            # Extra safety checks, even though Discord already applies these filters.
-            if str(message_data.get("channel_id")) != str(DERANK_CHANNEL_ID):
-                continue
-
-            author = message_data.get("author") or {}
-
-            if str(author.get("id")) != str(bot_id):
-                continue
-
-            embeds = message_data.get("embeds") or []
-
-            if not embeds:
-                continue
-
-            message_id = int(message_data["id"])
-
-            if (
-                oldest_message_id is None
-                or message_id < oldest_message_id
-            ):
-                oldest_message_id = message_id
-
-            # Search only the embeds, never the message content.
-            content = _get_derank_source(embeds)
-
-            if content is None:
-                continue
-
-            # Capture the exact staff mention after "Deranked by".
-            match = _DERANK_RE.search(content)
-
-            if match is None:
-                continue
-
-            staff_id = int(match.group(1))
-
-            # Only count target mentions before the staff marker.
-            target_text = content[:match.start()]
-
-            # Deduplicate targets within this individual derank log.
-            deranked_members = set(
-                _MENTION_RE.findall(target_text)
-            )
-
-            entries = len(deranked_members)
-
-            if entries == 0:
-                continue
-
-            counts[staff_id] = counts.get(staff_id, 0) + entries
-            total += entries
-
-        # Stop if Discord gave us no usable message IDs.
-        if oldest_message_id is None:
-            break
-
-        # Move the cursor backwards for the next page.
-        before_id = str(oldest_message_id)
-
-        # If fewer than a full page came back, there are no more results.
-        if len(messages) < DERANK_SEARCH_PAGE_SIZE:
-            break
+        counts[staff_id] = counts.get(staff_id, 0) + entries
+        total += entries
 
     return counts, total
 
@@ -587,11 +467,10 @@ def build_leaderboard_command(
             try:
                 empty: tuple[Counts, int] = ({}, 0)
 
-                async def creation_job() -> tuple[Counts, int]:
-                    if creation_channel is None:
-                        return empty
-
-                    return await _tally_reviews(
+                # Run scans sequentially to reduce peak memory and concurrent
+                # network activity on the Render free tier.
+                if creation_channel is not None:
+                    creation_counts, creation_total = await _tally_reviews(
                         creation_channel,
                         bot_id,
                         month_start=month_start,
@@ -599,12 +478,11 @@ def build_leaderboard_command(
                         accepted_only=False,
                         creation_only=True,
                     )
+                else:
+                    creation_counts, creation_total = empty
 
-                async def booster_job() -> tuple[Counts, int]:
-                    if booster_channel is None:
-                        return empty
-
-                    return await _tally_reviews(
+                if booster_channel is not None:
+                    booster_counts, booster_total = await _tally_reviews(
                         booster_channel,
                         bot_id,
                         month_start=month_start,
@@ -612,27 +490,17 @@ def build_leaderboard_command(
                         accepted_only=True,
                         creation_only=False,
                     )
+                else:
+                    booster_counts, booster_total = empty
 
-                async def derank_job() -> tuple[Counts, int]:
-                    if roleshift_channel is None:
-                        return empty
-
-                    return await _tally_deranks(
+                if roleshift_channel is not None:
+                    derank_counts, derank_total = await _tally_deranks(
                         roleshift_channel,
                         bot_id,
                         month_start=month_start,
-                        http=interaction.client.http,
                     )
-
-                (
-                    (creation_counts, creation_total),
-                    (booster_counts, booster_total),
-                    (derank_counts, derank_total),
-                ) = await asyncio.gather(
-                    creation_job(),
-                    booster_job(),
-                    derank_job(),
-                )
+                else:
+                    derank_counts, derank_total = empty
 
             except discord.Forbidden:
                 await reply(
@@ -642,27 +510,14 @@ def build_leaderboard_command(
                 )
                 return
 
-            except RuntimeError as error:
-                logger.error(
-                    "Leaderboard message search failed: %s",
-                    error,
-                )
-
-                await reply(
-                    interaction,
-                    "Discord's derank message search isn't ready yet. "
-                    "Please try again shortly.",
-                )
-                return
-
             except discord.HTTPException:
                 logger.exception(
-                    "Could not read channel history or search messages for the leaderboard"
+                    "Could not read channel history for the leaderboard"
                 )
 
                 await reply(
                     interaction,
-                    "Discord didn't let me read or search the channels. "
+                    "Discord didn't let me read the channel history. "
                     "Try again shortly.",
                 )
                 return
