@@ -1,10 +1,11 @@
+
 from __future__ import annotations
 
 import asyncio
 import heapq
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import discord
@@ -18,13 +19,6 @@ TOP_N = 5
 
 # Fixed channel containing the booster derank logs.
 DERANK_CHANNEL_ID = 1272268411145289831
-
-# A message is created BEFORE it is reviewed, so we look slightly further back than the
-# start of the month to catch submissions that were reviewed early this month.
-# Creation submissions are re-sent every 24h while pending, so a short buffer is enough.
-# Booster requests are never re-sent, so they get a longer buffer.
-CREATION_LOOKBACK = timedelta(days=3)
-BOOSTER_LOOKBACK = timedelta(days=14)
 
 # Matches the status line the bot writes when a request is reviewed.
 _REVIEW_RE = re.compile(
@@ -62,7 +56,7 @@ def _month_bounds() -> tuple[datetime, datetime]:
 
 
 def _history_after(timestamp: datetime) -> discord.Object:
-    """Convert a datetime to a Discord snowflake for history pagination."""
+    """Create a snowflake marking the beginning of the requested period."""
     return discord.Object(
         id=discord.utils.time_snowflake(timestamp)
     )
@@ -90,7 +84,7 @@ def _embed_text(embeds: list[discord.Embed]) -> str:
 
 
 def _has_creation_information(message: discord.Message) -> bool:
-    """Identify creation requests using the original information-field checks."""
+    """Identify creation requests using their information fields."""
     for embed in message.embeds:
         for field in embed.fields:
             field_name = re.sub(
@@ -118,39 +112,66 @@ def _has_creation_information(message: discord.Message) -> bool:
     return False
 
 
+def _get_derank_source(embeds: list[dict[str, Any]]) -> str | None:
+    """Get the first embed containing the derank marker."""
+    for embed in embeds:
+        parts = [
+            embed.get("title") or "",
+            embed.get("description") or "",
+        ]
+
+        for field in embed.get("fields", []):
+            parts.extend([
+                field.get("name") or "",
+                field.get("value") or "",
+            ])
+
+        author = embed.get("author") or {}
+        if author:
+            parts.append(author.get("name") or "")
+
+        footer = embed.get("footer") or {}
+        if footer:
+            parts.append(footer.get("text") or "")
+
+        embed_text = "\n".join(parts)
+
+        if _DERANK_RE.search(embed_text):
+            return embed_text
+
+    return None
+
+
 async def _tally_reviews(
     channel: discord.TextChannel,
     bot_id: int,
     *,
     month_start: datetime,
-    lookback: timedelta,
     accepted_only: bool,
     creation_only: bool,
 ) -> tuple[Counts, int]:
-    """Count creation reviews or booster approvals from the bot's review embeds.
-
-    Creation reviews are identified by their information text.
-    Booster requests are identified by the absence of that information text.
-    """
+    """Count this month's creation reviews or booster approvals."""
     counts: Counts = {}
     total = 0
     start_ts = int(month_start.timestamp())
 
-    # Start at the requested date and paginate FORWARD.
-    # oldest_first=True is important: with after=..., setting it to False
-    # makes discord.py start at the newest messages and work backwards.
-    after_id = _history_after(month_start - lookback)
+    # Only retrieve messages from the beginning of this month onwards.
+    after_id = _history_after(month_start)
 
     async for message in channel.history(
         limit=None,
         after=after_id,
         oldest_first=True,
     ):
-        # Only inspect messages authored by this bot.
-        if message.author.id != bot_id or not message.embeds:
+        # Immediately discard messages that aren't authored by this bot.
+        if message.author.id != bot_id:
             continue
 
-        # Preserve the original creation-versus-booster classification.
+        # Ignore bot messages without embeds.
+        if not message.embeds:
+            continue
+
+        # Classify creation requests separately from booster requests.
         has_information = _has_creation_information(message)
 
         if creation_only and not has_information:
@@ -159,7 +180,6 @@ async def _tally_reviews(
         if not creation_only and has_information:
             continue
 
-        # Only inspect the bot's embeds.
         text = _embed_text(message.embeds)
 
         if not text:
@@ -171,12 +191,10 @@ async def _tally_reviews(
             continue
 
         # Booster requests only count when Accepted.
-        # Denied and pending booster requests are not counted.
         if accepted_only and match.group(1) != "Accepted":
             continue
 
-        # Creation reviews count both Accepted and Denied.
-        # Use the review time written in the embed, not message creation time.
+        # Use the review timestamp written in the embed.
         if int(match.group(3)) < start_ts:
             continue
 
@@ -193,14 +211,7 @@ async def _tally_deranks(
     *,
     month_start: datetime,
 ) -> tuple[Counts, int]:
-    """Count deranks from the bot's own embeds using normal channel history.
-
-    Does not use Discord's message-search endpoint and does not require
-    Message Content privileged intent.
-
-    Messages are streamed one at a time. Other authors are skipped immediately.
-    Only embeds from messages authored by this bot are inspected.
-    """
+    """Count this month's deranks from the bot's own embeds."""
     counts: Counts = {}
     total = 0
 
@@ -212,13 +223,11 @@ async def _tally_deranks(
         )
         return counts, total
 
-    guild = getattr(channel, "guild", None)
-
-    if guild is None:
+    if getattr(channel, "guild", None) is None:
         logger.error("Derank scan refused: channel has no guild.")
         return counts, total
 
-    # Start at the beginning of this month and paginate FORWARD.
+    # Only retrieve messages from the beginning of this month onwards.
     after_id = _history_after(month_start)
 
     async for message in channel.history(
@@ -226,11 +235,13 @@ async def _tally_deranks(
         after=after_id,
         oldest_first=True,
     ):
-        # Ignore other authors before inspecting their embeds.
-        if message.author.id != bot_id or not message.embeds:
+        # Immediately discard messages that aren't authored by this bot.
+        if message.author.id != bot_id:
             continue
 
-        # Only inspect embeds, never message content.
+        if not message.embeds:
+            continue
+
         content = _embed_text(message.embeds)
 
         if not content:
@@ -241,7 +252,7 @@ async def _tally_deranks(
         if match is None:
             continue
 
-        # Exact staff mention immediately after "Deranked by".
+        # Exact staff mention immediately following "Deranked by".
         staff_id = int(match.group(1))
 
         # Only count target mentions before the staff marker.
@@ -311,7 +322,7 @@ class LeaderboardView(discord.ui.View):
         self.page = 0
 
     def render_content(self) -> str:
-        """Render the currently selected category as a normal Discord message."""
+        """Render the currently selected category."""
         title, rows, total = self.boards[self.page]
 
         month_info = (
@@ -458,7 +469,6 @@ def build_leaderboard_command(
                         creation_channel,
                         bot_id,
                         month_start=month_start,
-                        lookback=CREATION_LOOKBACK,
                         accepted_only=False,
                         creation_only=True,
                     )
@@ -470,7 +480,6 @@ def build_leaderboard_command(
                         booster_channel,
                         bot_id,
                         month_start=month_start,
-                        lookback=BOOSTER_LOOKBACK,
                         accepted_only=True,
                         creation_only=False,
                     )
