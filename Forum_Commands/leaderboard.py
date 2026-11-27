@@ -930,7 +930,6 @@ def build_leaderboard_command(
 
                 return (
                     "# Staff Leaderboard\n"
-                    f"*Loading… {percent}%*\n\n"
                     f"`{_bar(percent)}` {percent}%\n\n"
                     + "\n".join(lines)
                 )
