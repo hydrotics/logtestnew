@@ -62,8 +62,10 @@ def _message_text(message: discord.Message) -> str:
         parts.extend([
             embed.title or "",
             embed.description or "",
-            getattr(embed.author, "name", "") or "",
-            getattr(embed.footer, "text", "") or "",
+            getattr(embed, "author", None).name
+            if getattr(embed, "author", None) else "",
+            getattr(embed, "footer", None).text
+            if getattr(embed, "footer", None) else "",
         ])
 
         for field in embed.fields:
@@ -71,6 +73,34 @@ def _message_text(message: discord.Message) -> str:
                 field.name or "",
                 field.value or "",
             ])
+
+    return "\n".join(parts)
+
+
+def _derank_message_text(message: discord.Message) -> str:
+    """Collect derank text in display order so member mentions precede the staff marker."""
+    parts = [message.content or ""]
+
+    for embed in message.embeds:
+        parts.extend([
+            embed.title or "",
+            embed.description or "",
+        ])
+
+        # Embed fields are displayed before the footer.
+        for field in embed.fields:
+            parts.extend([
+                field.name or "",
+                field.value or "",
+            ])
+
+        author = getattr(embed, "author", None)
+        if author:
+            parts.append(author.name or "")
+
+        footer = getattr(embed, "footer", None)
+        if footer:
+            parts.append(footer.text or "")
 
     return "\n".join(parts)
 
@@ -170,9 +200,11 @@ async def _tally_deranks(
     *,
     month_start: datetime,
 ) -> tuple[Counts, int]:
-    """Count deranks from the bot's own roleshift log messages posted this month.
+    """Count deranked members attributed to the staff member in each roleshift log.
 
-    Deranked by is checked in both message content and embed content.
+    Only member mentions BEFORE 'Deranked by <@staff>' are counted.
+    The staff member mentioned after 'Deranked by' receives credit for those deranks.
+    The total is the number of actual deranked members, not the number of log messages.
     """
     counts: Counts = {}
     total = 0
@@ -185,7 +217,7 @@ async def _tally_deranks(
         if message.author.id != bot_id:
             continue
 
-        content = _message_text(message)
+        content = _derank_message_text(message)
 
         if not content or "Deranked by" not in content:
             continue
@@ -194,8 +226,15 @@ async def _tally_deranks(
         if match is None:
             continue
 
-        # One message can log several members; every mention except the staff one counts.
-        entries = max(1, len(_MENTION_RE.findall(content)) - 1)
+        # Only count mentions appearing BEFORE the "Deranked by" staff marker.
+        # This prevents unrelated mentions elsewhere in the message from being counted.
+        deranked_members = _MENTION_RE.findall(content[:match.start()])
+
+        entries = len(deranked_members)
+
+        # Do not invent a derank count when no target members were found.
+        if entries == 0:
+            continue
 
         staff_id = int(match.group(1))
         counts[staff_id] = counts.get(staff_id, 0) + entries
@@ -224,7 +263,11 @@ def _board_text(
         return f"{header}\n\n*Nothing yet this month.*"
 
     lines = [
-        f"{index}. <@{staff_id}> · {round(count * 100 / total)}%"
+        (
+            f"{index}. <@{staff_id}> · "
+            f"{round(count * 100 / total) if total else 0}% · "
+            f"{count}/{total} done"
+        )
         for index, (staff_id, count) in enumerate(rows, 1)
     ]
 
