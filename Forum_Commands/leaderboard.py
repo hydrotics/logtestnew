@@ -8,7 +8,7 @@ import re
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 import discord
@@ -23,16 +23,33 @@ TOP_N = 5
 DERANK_CHANNEL_ID = 1272268411145289831
 
 # ---------------------------------------------------------------------------
-# Scan tuning
+# Scan strategy
+#
+# FAST PATH (USE_SEARCH): Discord's guild message search can filter on the
+# server by author (the bot), "has embed" and an id range, so images, videos,
+# non-bot messages and plain text are never downloaded. It returns an exact
+# total up front, so the progress bar is exact too.
+#
+# The search endpoint is NOT part of Discord's documented bot API. If it is
+# unavailable or returns anything unexpected, the scan automatically falls back
+# to the slower full-history scan below, so the command keeps working.
+#
+# Caveat: search results come from Discord's search index, which can trail
+# real time by a short while. For a guaranteed-exact count at the cost of
+# speed, set USE_SEARCH = False.
 # ---------------------------------------------------------------------------
 
-# The month is cut into windows of this many hours. Fewer, larger windows waste
-# fewer requests (every window costs at least one page).
-SCAN_WINDOW_HOURS = 24
+USE_SEARCH = True
 
-# Max windows being scanned at once per channel. This is only an upper bound:
-# the rate gate below decides when a request may actually be sent.
-MAX_PARALLEL_WINDOWS = 6
+SEARCH_PAGE_SIZE = 25          # Discord's maximum for search.
+SEARCH_MAX_RESULTS = 9000      # Offsets are capped near 10,000: split above this.
+SEARCH_INDEX_MAX_WAIT = 20.0   # Seconds to wait if the index is still building.
+MAX_PARALLEL_PAGES = 4
+
+# FALLBACK PATH (full history scan)
+SCAN_WINDOW_HOURS = 96
+MAX_PARALLEL_WINDOWS = 4
+PAGE_SIZE = 100                # Discord's hard maximum per history request.
 
 # A review message is posted before it is reviewed, so requests posted shortly
 # before the month began can still be reviewed inside it. These extra days are
@@ -40,25 +57,20 @@ MAX_PARALLEL_WINDOWS = 6
 # counted. Set this to the longest time a request normally sits pending.
 REVIEW_LOOKBACK_DAYS = 3
 
-PAGE_SIZE = 100  # Discord's hard maximum per history request.
-
 # ---------------------------------------------------------------------------
 # Rate-limit safety
 # ---------------------------------------------------------------------------
 
 API_BASE = "https://discord.com/api/v10"
 
-# Requests are only sent when Discord's own rate-limit headers say there is
-# room (see _Gate). On top of that, a global ceiling across all channels.
-# Discord's global limit is 50/s; this stays well under it.
+# Global ceiling across all requests. Discord's own limit is 50/s.
 GLOBAL_MAX_REQUESTS_PER_SECOND = 20
 
 # Extra wait after a bucket's reset time before using it again.
 RESET_PADDING = 0.1
 
-# If Discord still answers 429 (e.g. another feature of the bot is using the
-# same channel at the same moment), the Retry-After is obeyed. After this many
-# hits the scan is aborted rather than continuing to push.
+# If Discord still answers 429, Retry-After is obeyed. After this many hits the
+# scan is aborted rather than continuing to push.
 MAX_RATE_LIMIT_HITS = 3
 
 MAX_SERVER_ERROR_RETRIES = 3
@@ -68,11 +80,10 @@ REQUEST_TIMEOUT_SECONDS = 30
 # Progress display
 # ---------------------------------------------------------------------------
 
-# How often the loading message is edited. Kept slow on purpose so the
-# progress updates themselves can never hit a rate limit.
+# Kept slow on purpose so the progress edits can never hit a rate limit.
 PROGRESS_EDIT_INTERVAL = 3.0
 
-# Interaction tokens expire after 15 minutes, so the scan is cut off before that.
+# Interaction tokens expire after 15 minutes.
 SCAN_TIMEOUT_SECONDS = 13 * 60
 
 BAR_WIDTH = 20
@@ -208,16 +219,14 @@ def _parse_derank(embeds: list[dict[str, Any]]) -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 # Rate-limit gate
 #
-# Instead of sending requests and reacting to 429s, every request must first
-# pass two checks:
+# Every request passes two checks before it is sent:
 #
 #   1. _GlobalPacer: no more than GLOBAL_MAX_REQUESTS_PER_SECOND in any second.
-#   2. _Gate (one per channel): driven by Discord's own X-RateLimit-* response
-#      headers. A request starts only if
-#          remaining - (requests already in flight) >= 1
-#      otherwise it waits for the bucket's reset. Until the first response has
-#      told us the bucket size, only ONE request is allowed in flight (a probe),
-#      so the opening burst that normally triggers 429s cannot happen.
+#   2. _Gate (one per bucket): driven by Discord's own X-RateLimit-* headers. A
+#      request starts only if  remaining - (requests in flight) >= 1,  otherwise
+#      it waits for the bucket's reset. Until the first response has revealed the
+#      bucket size, only ONE request is allowed in flight (a probe), so the
+#      opening burst that normally triggers 429s cannot happen.
 # ---------------------------------------------------------------------------
 
 
@@ -227,6 +236,17 @@ class ScanError(Exception):
 
 class AccessError(ScanError):
     pass
+
+
+class SearchUnavailable(Exception):
+    """Search can't be used; fall back to the history scan."""
+
+
+class _HttpError(Exception):
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.body = body
 
 
 class _GlobalPacer:
@@ -347,31 +367,54 @@ class _Gate:
             self._cond.notify_all()
 
 
+def _retry_after(headers: Any, body: str) -> float:
+    try:
+        return max(0.0, float(headers.get("Retry-After")))
+    except (TypeError, ValueError):
+        pass
+
+    match = re.search(r'"retry_after"\s*:\s*([0-9.]+)', body or "")
+
+    if match:
+        return float(match.group(1))
+
+    return 5.0
+
+
 class _Fetcher:
-    """Paced, header-aware reader for GET /channels/{id}/messages."""
+    """Paced, header-aware reader for Discord's REST API."""
 
     def __init__(self, session: aiohttp.ClientSession, token: str) -> None:
         self._session = session
         self._headers = {
             "Authorization": f"Bot {token}",
-            "User-Agent": "DiscordBot (leaderboard-scan, 1.0)",
+            "User-Agent": "DiscordBot (leaderboard-scan, 2.0)",
         }
-        self._gates: dict[int, _Gate] = {}
+        self._gates: dict[Any, _Gate] = {}
         self._pacer = _GlobalPacer()
         self.rate_limit_hits = 0
+        self.search_disabled = not USE_SEARCH
 
-    def _gate(self, channel_id: int) -> _Gate:
-        gate = self._gates.get(channel_id)
+    def _gate(self, key: Any) -> _Gate:
+        gate = self._gates.get(key)
 
         if gate is None:
-            gate = self._gates[channel_id] = _Gate()
+            gate = self._gates[key] = _Gate()
 
         return gate
 
-    async def page(self, channel_id: int, after_id: int) -> list[dict[str, Any]]:
-        url = f"{API_BASE}/channels/{channel_id}/messages"
-        params = {"limit": str(PAGE_SIZE), "after": str(after_id)}
-        gate = self._gate(channel_id)
+    async def _get(
+        self,
+        gate_key: Any,
+        url: str,
+        params: dict[str, str],
+    ) -> tuple[int, Any]:
+        """GET with gating. Returns (status, json) for 200/202.
+
+        Raises _HttpError for other statuses and ScanError for network failure
+        or repeated 429s.
+        """
+        gate = self._gate(gate_key)
         server_errors = 0
 
         while True:
@@ -392,8 +435,9 @@ class _Fetcher:
                     status = response.status
                     headers = response.headers
 
-                    if status == 200:
+                    if status in (200, 202):
                         data = await response.json(content_type=None)
+                        body = ""
                     else:
                         data = None
                         body = await response.text()
@@ -410,10 +454,9 @@ class _Fetcher:
                 await gate.release()
                 raise
 
-            if status == 200:
+            if status in (200, 202):
                 await gate.release(headers)
-                data.sort(key=lambda message: int(message["id"]))
-                return data
+                return status, data
 
             if status == 429:
                 retry_after = _retry_after(headers, body)
@@ -428,8 +471,8 @@ class _Fetcher:
 
                 self.rate_limit_hits += 1
                 logger.warning(
-                    "Leaderboard hit a 429 on channel %s (retry in %.2fs, hit %d/%d)",
-                    channel_id,
+                    "Leaderboard hit a 429 on %s (retry in %.2fs, hit %d/%d)",
+                    gate_key,
                     retry_after,
                     self.rate_limit_hits,
                     MAX_RATE_LIMIT_HITS,
@@ -445,76 +488,273 @@ class _Fetcher:
 
             await gate.release(headers)
 
-            if status in (401, 403, 404):
+            if status >= 500:
+                server_errors += 1
+
+                if server_errors <= MAX_SERVER_ERROR_RETRIES:
+                    await asyncio.sleep(1.0 + server_errors)
+                    continue
+
+            raise _HttpError(status, body)
+
+    async def history_page(self, channel_id: int, after_id: int) -> list[dict[str, Any]]:
+        url = f"{API_BASE}/channels/{channel_id}/messages"
+        params = {"limit": str(PAGE_SIZE), "after": str(after_id)}
+
+        try:
+            _, data = await self._get(("channel", channel_id), url, params)
+        except _HttpError as exc:
+            if exc.status in (401, 403, 404):
                 raise AccessError(
                     "I need View Channel and Read Message History in that channel."
                 )
 
-            if status >= 500:
-                server_errors += 1
-
-                if server_errors > MAX_SERVER_ERROR_RETRIES:
-                    raise ScanError("Discord had a problem. Try again shortly.")
-
-                await asyncio.sleep(1.0 + server_errors)
-                continue
-
-            logger.error("Unexpected %s reading channel %s: %s", status, channel_id, body[:200])
+            logger.error(
+                "Unexpected %s reading channel %s: %s",
+                exc.status,
+                channel_id,
+                exc.body[:200],
+            )
             raise ScanError("Discord didn't let me read this channel. Try again shortly.")
 
+        data.sort(key=lambda message: int(message["id"]))
+        return data
 
-def _retry_after(headers: Any, body: str) -> float:
-    try:
-        return max(0.0, float(headers.get("Retry-After")))
-    except (TypeError, ValueError):
-        pass
+    async def search(
+        self,
+        guild_id: int,
+        channel_id: int,
+        bot_id: int,
+        start_id: int,
+        end_id: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        url = f"{API_BASE}/guilds/{guild_id}/messages/search"
+        params = {
+            "author_id": str(bot_id),
+            "has": "embed",
+            "channel_id": str(channel_id),
+            "min_id": str(start_id - 1),
+            "max_id": str(end_id),
+            "sort_by": "timestamp",
+            "sort_order": "asc",
+            "limit": str(SEARCH_PAGE_SIZE),
+            "offset": str(offset),
+            "include_nsfw": "true",
+        }
 
-    match = re.search(r'"retry_after"\s*:\s*([0-9.]+)', body or "")
+        waited = 0.0
 
-    if match:
-        return float(match.group(1))
+        while True:
+            try:
+                status, data = await self._get(("search", guild_id), url, params)
+            except _HttpError as exc:
+                raise SearchUnavailable(f"search returned HTTP {exc.status}")
 
-    return 5.0
+            if status == 200 and isinstance(data, dict) and "messages" in data:
+                return data
+
+            if status == 202 and isinstance(data, dict):
+                # The search index for this guild is still being built.
+                try:
+                    wait = min(10.0, float(data.get("retry_after") or 2.0) + 0.5)
+                except (TypeError, ValueError):
+                    wait = 2.5
+
+                waited += wait
+
+                if waited > SEARCH_INDEX_MAX_WAIT:
+                    raise SearchUnavailable("search index not ready")
+
+                await asyncio.sleep(wait)
+                continue
+
+            raise SearchUnavailable("unexpected search response")
 
 
 # ---------------------------------------------------------------------------
-# Scanning
-#
-#   * Raw REST pages are parsed as dicts (no Message objects), and non-bot
-#     messages are dropped after one lookup.
-#   * Each window stops at its own end. (channel.history with both `after` and
-#     `before` plus oldest_first pages onward past `before`, so every window
-#     would re-read the rest of the channel.)
-#   * Windows are disjoint snowflake ranges, so nothing is double counted.
-#   * Nothing after "now" is scanned.
-#
-# Intents: this uses REST only, so no gateway intents are needed. Because it only
-# reads messages authored by the bot itself, embed contents are returned even
-# without the Message Content intent.
+# Progress
 # ---------------------------------------------------------------------------
 
 
 class _Progress:
-    """Time-weighted progress of one channel scan (0.0 to 1.0)."""
+    """Progress of one channel scan, as done/total units (0.0 to 1.0)."""
 
     def __init__(self) -> None:
-        self._fractions: list[float] = []
-        self._weights: list[int] = []
+        self.total = 0.0
+        self.done = 0.0
 
-    def setup(self, ranges: list[tuple[int, int]]) -> None:
-        self._fractions = [0.0] * len(ranges)
-        self._weights = [end - start for start, end in ranges]
+    def reset(self) -> None:
+        self.total = 0.0
+        self.done = 0.0
 
-    def set(self, index: int, fraction: float) -> None:
-        self._fractions[index] = max(0.0, min(1.0, fraction))
+    def add_total(self, amount: float) -> None:
+        self.total += amount
+
+    def add_done(self, amount: float) -> None:
+        self.done += amount
 
     def fraction(self) -> float:
-        total = sum(self._weights)
-
-        if not total:
+        if self.total <= 0:
             return 0.0
 
-        return sum(f * w for f, w in zip(self._fractions, self._weights)) / total
+        return max(0.0, min(1.0, self.done / self.total))
+
+
+async def _gather_or_cancel(coros: list[Awaitable[Any]]) -> list[Any]:
+    """gather(), but if one fails the others are cancelled and awaited."""
+    tasks = [asyncio.ensure_future(coro) for coro in coros]
+
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+class _Tally:
+    def __init__(self) -> None:
+        self.counts: Counts = {}
+        self.total = 0
+        self.seen: set[int] = set()
+
+    def add(self, staff_id: int, amount: int) -> None:
+        self.counts[staff_id] = self.counts.get(staff_id, 0) + amount
+        self.total += amount
+
+
+# ---------------------------------------------------------------------------
+# Fast path: server-side filtered search
+# ---------------------------------------------------------------------------
+
+
+async def _search_range(
+    fetcher: _Fetcher,
+    guild_id: int,
+    channel_id: int,
+    bot_id: int,
+    *,
+    start_id: int,
+    end_id: int,
+    parse: Parser,
+    progress: _Progress,
+    tally: _Tally,
+    pages_semaphore: asyncio.Semaphore,
+) -> None:
+    def consume(data: dict[str, Any]) -> None:
+        for group in data.get("messages") or []:
+            for message in group:
+                # Context neighbours are returned without "hit": ignore them.
+                if "hit" in message and not message["hit"]:
+                    continue
+
+                message_id = int(message["id"])
+
+                if not (start_id <= message_id < end_id):
+                    continue
+
+                if message_id in tally.seen:
+                    continue
+
+                tally.seen.add(message_id)
+
+                if int((message.get("author") or {}).get("id") or 0) != bot_id:
+                    continue
+
+                embeds = message.get("embeds")
+
+                if not embeds:
+                    continue
+
+                result = parse(embeds)
+
+                if result is not None:
+                    tally.add(*result)
+
+    progress.add_total(1)
+
+    first = await fetcher.search(
+        guild_id, channel_id, bot_id, start_id, end_id, offset=0
+    )
+
+    total_results = int(first.get("total_results") or 0)
+
+    if total_results > SEARCH_MAX_RESULTS and end_id - start_id > 1:
+        # Too many hits for one offset range: split the id range in two.
+        progress.add_total(-1)
+        middle = (start_id + end_id) // 2
+
+        await _gather_or_cancel([
+            _search_range(
+                fetcher, guild_id, channel_id, bot_id,
+                start_id=low, end_id=high, parse=parse,
+                progress=progress, tally=tally, pages_semaphore=pages_semaphore,
+            )
+            for low, high in ((start_id, middle), (middle, end_id))
+        ])
+        return
+
+    pages = max(1, math.ceil(total_results / SEARCH_PAGE_SIZE))
+
+    progress.add_total(pages - 1)
+    consume(first)
+    progress.add_done(1)
+
+    async def fetch(offset: int) -> None:
+        async with pages_semaphore:
+            data = await fetcher.search(
+                guild_id, channel_id, bot_id, start_id, end_id, offset=offset
+            )
+
+        consume(data)
+        progress.add_done(1)
+
+    await _gather_or_cancel([
+        fetch(offset) for offset in range(SEARCH_PAGE_SIZE, pages * SEARCH_PAGE_SIZE, SEARCH_PAGE_SIZE)
+    ])
+
+
+async def _scan_with_search(
+    fetcher: _Fetcher,
+    guild_id: int,
+    channel_id: int,
+    bot_id: int,
+    *,
+    start: datetime,
+    end: datetime,
+    parse: Parser,
+    progress: _Progress,
+) -> tuple[Counts, int]:
+    tally = _Tally()
+
+    if start < end:
+        await _search_range(
+            fetcher,
+            guild_id,
+            channel_id,
+            bot_id,
+            start_id=discord.utils.time_snowflake(start),
+            end_id=discord.utils.time_snowflake(end),
+            parse=parse,
+            progress=progress,
+            tally=tally,
+            pages_semaphore=asyncio.Semaphore(MAX_PARALLEL_PAGES),
+        )
+
+    return tally.counts, tally.total
+
+
+# ---------------------------------------------------------------------------
+# Fallback: full history scan
+#
+#   * Raw REST pages parsed as dicts (no Message objects); non-bot messages are
+#     dropped after one lookup.
+#   * Each window stops at its own end. (channel.history with both `after` and
+#     `before` plus oldest_first pages onward past `before`.)
+#   * Windows are disjoint snowflake ranges, so nothing is double counted.
+# ---------------------------------------------------------------------------
 
 
 def _windows(start: datetime, end: datetime) -> list[tuple[int, int]]:
@@ -544,15 +784,15 @@ async def _scan_window(
     start_id: int,
     end_id: int,
     parse: Parser,
-    on_progress: Callable[[float], None],
-) -> tuple[Counts, int]:
-    counts: Counts = {}
-    total = 0
+    progress: _Progress,
+    tally: _Tally,
+) -> None:
     cursor = start_id - 1  # `after` is exclusive; the range is [start, end).
     span = max(1, end_id - start_id)
+    advanced = 0
 
     while True:
-        page = await fetcher.page(channel_id, cursor)
+        page = await fetcher.history_page(channel_id, cursor)
 
         if not page:
             break
@@ -576,25 +816,63 @@ async def _scan_window(
 
             result = parse(embeds)
 
-            if result is None:
-                continue
-
-            staff_id, amount = result
-            counts[staff_id] = counts.get(staff_id, 0) + amount
-            total += amount
+            if result is not None:
+                tally.add(*result)
 
         if finished or len(page) < PAGE_SIZE:
             break
 
         cursor = int(page[-1]["id"])
-        on_progress((cursor - start_id) / span)
+        position = min(span, max(0, cursor - start_id))
+        progress.add_done(position - advanced)
+        advanced = position
 
-    on_progress(1.0)
-    return counts, total
+    progress.add_done(span - advanced)
+
+
+async def _scan_with_history(
+    fetcher: _Fetcher,
+    channel_id: int,
+    bot_id: int,
+    *,
+    start: datetime,
+    end: datetime,
+    parse: Parser,
+    progress: _Progress,
+) -> tuple[Counts, int]:
+    tally = _Tally()
+    ranges = _windows(start, end) if start < end else []
+
+    progress.add_total(sum(e - s for s, e in ranges))
+
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_WINDOWS)
+
+    async def run(start_id: int, end_id: int) -> None:
+        async with semaphore:
+            await _scan_window(
+                fetcher,
+                channel_id,
+                bot_id,
+                start_id=start_id,
+                end_id=end_id,
+                parse=parse,
+                progress=progress,
+                tally=tally,
+            )
+
+    await _gather_or_cancel([run(s, e) for s, e in ranges])
+
+    return tally.counts, tally.total
+
+
+# ---------------------------------------------------------------------------
+# One board
+# ---------------------------------------------------------------------------
 
 
 async def _scan_channel(
     fetcher: _Fetcher,
+    guild_id: int,
     channel_id: int,
     bot_id: int,
     *,
@@ -608,56 +886,50 @@ async def _scan_channel(
 
     # Never scan the future part of the month.
     end = min(end, datetime.now(timezone.utc))
-    ranges = _windows(start, end) if start < end else []
 
-    progress.setup(ranges)
-
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_WINDOWS)
-
-    async def run(index: int, start_id: int, end_id: int) -> tuple[Counts, int]:
-        async with semaphore:
-            return await _scan_window(
+    if not fetcher.search_disabled:
+        try:
+            result = await _scan_with_search(
                 fetcher,
+                guild_id,
                 channel_id,
                 bot_id,
-                start_id=start_id,
-                end_id=end_id,
+                start=start,
+                end=end,
                 parse=parse,
-                on_progress=lambda fraction: progress.set(index, fraction),
+                progress=progress,
             )
+            logger.info(
+                "Leaderboard scan %s (search): %d counted, %.1fs",
+                label,
+                result[1],
+                time.perf_counter() - started,
+            )
+            return result
+        except SearchUnavailable as exc:
+            fetcher.search_disabled = True
+            logger.warning(
+                "Leaderboard search unavailable (%s); using the full history scan.",
+                exc,
+            )
+            progress.reset()
 
-    tasks = [
-        asyncio.create_task(run(index, s, e))
-        for index, (s, e) in enumerate(ranges)
-    ]
-
-    try:
-        results = await asyncio.gather(*tasks)
-    except BaseException:
-        # One failed window makes the whole board unusable: stop the rest
-        # instead of letting them keep requesting in the background.
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-    combined: Counts = {}
-    total = 0
-
-    for counts, window_total in results:
-        for staff_id, count in counts.items():
-            combined[staff_id] = combined.get(staff_id, 0) + count
-        total += window_total
-
+    result = await _scan_with_history(
+        fetcher,
+        channel_id,
+        bot_id,
+        start=start,
+        end=end,
+        parse=parse,
+        progress=progress,
+    )
     logger.info(
-        "Leaderboard scan %s: %d windows, %d counted, %.1fs",
+        "Leaderboard scan %s (history): %d counted, %.1fs",
         label,
-        len(ranges),
-        total,
+        result[1],
         time.perf_counter() - started,
     )
-
-    return combined, total
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -696,8 +968,7 @@ def _board_text(
 
 
 def _percent(fraction: float, *, done: bool) -> int:
-    value = int(fraction * 100)
-    return 100 if done else min(99, max(0, value))
+    return 100 if done else min(99, max(0, int(fraction * 100)))
 
 
 def _bar(percent: int) -> str:
@@ -911,7 +1182,6 @@ def build_leaderboard_command(
 
                     state = view.results[index]
                     done = state is not None
-
                     fraction = 1.0 if done else progresses[index].fraction()
                     fractions.append(fraction)
 
@@ -924,12 +1194,18 @@ def build_leaderboard_command(
 
                     lines.append(f"{title}: {status}")
 
-                overall_fraction = sum(fractions) / len(fractions) if fractions else 0.0
-                overall_done = all(view.results[i] is not None for i, c in enumerate(channels) if c is not None)
-                percent = _percent(overall_fraction, done=overall_done)
+                overall = sum(fractions) / len(fractions) if fractions else 0.0
+                percent = _percent(
+                    overall,
+                    done=all(
+                        view.results[i] is not None
+                        for i, channel in enumerate(channels)
+                        if channel is not None
+                    ),
+                )
 
                 return (
-                    "# Staff Leaderboard\n"
+                    "# Staff Leaderboard\n\n"
                     f"`{_bar(percent)}` {percent}%\n\n"
                     + "\n".join(lines)
                 )
@@ -973,6 +1249,7 @@ def build_leaderboard_command(
                     try:
                         counts, total = await _scan_channel(
                             fetcher,
+                            guild.id,
                             channel.id,
                             bot_id,
                             start=starts[index],
