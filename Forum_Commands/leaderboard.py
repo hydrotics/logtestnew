@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +10,7 @@ from typing import Any
 
 import discord
 from discord import app_commands
+from discord.http import Route
 
 import group_scan
 
@@ -19,6 +21,10 @@ TOP_N = 5
 # Fixed channel containing the booster derank logs.
 DERANK_CHANNEL_ID = 1272268411145289831
 
+# Retained from the previous implementation.
+# Discord message search is not used because it requires Message Content intent.
+DERANK_SEARCH_PAGE_SIZE = 25
+
 # A message is created BEFORE it is reviewed, so we look slightly further back than the
 # start of the month to catch submissions that were reviewed early this month.
 # Creation submissions are re-sent every 24h while pending, so a short buffer is enough.
@@ -26,9 +32,7 @@ DERANK_CHANNEL_ID = 1272268411145289831
 CREATION_LOOKBACK = timedelta(days=3)
 BOOSTER_LOOKBACK = timedelta(days=14)
 
-# Matches the status line the bot writes when a request is reviewed, e.g.
-#   **Status:** Accepted by <@123> · <t:1700000000:R>
-#   **Status:** Denied by <@123> · <t:1700000000:R> · `reason`
+# Matches the status line the bot writes when a request is reviewed.
 _REVIEW_RE = re.compile(
     r"\*\*Status:\*\*\s*(Accepted|Denied) by <@!?(\d+)>\s*[·\u00b7]\s*<t:(\d+)"
 )
@@ -46,6 +50,8 @@ _DERANK_RE = re.compile(
 # Matches normal Discord user mentions, excluding roles and channels.
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
 
+_COUNTS_EMPTY: tuple[dict[int, int], int] = ({}, 0)
+
 Counts = dict[int, int]
 
 
@@ -61,8 +67,15 @@ def _month_bounds() -> tuple[datetime, datetime]:
     return start, end
 
 
+def _history_after(timestamp: datetime) -> discord.Object:
+    """Convert a datetime to a Discord snowflake for history pagination."""
+    return discord.Object(
+        id=discord.utils.time_snowflake(timestamp)
+    )
+
+
 def _message_text(message: discord.Message) -> str:
-    """Collect searchable text from the bot's message and its embeds."""
+    """Collect searchable text from the message and all its embeds."""
     parts = [message.content or ""]
 
     for embed in message.embeds:
@@ -132,6 +145,37 @@ def _has_creation_information(message: discord.Message) -> bool:
     return False
 
 
+def _has_creation_information_fast(
+    message: discord.Message,
+    text: str,
+) -> bool:
+    """Classify a review using already-collected embed text."""
+    if _INFORMATION_RE.search(text):
+        return True
+
+    for embed in message.embeds:
+        for field in embed.fields:
+            name = field.name or ""
+
+            # Avoid regex substitution for ordinary field names.
+            if not any(char in name for char in "*_`~"):
+                field_name = name.strip().casefold()
+            else:
+                field_name = re.sub(
+                    r"[*_`~]",
+                    "",
+                    name,
+                ).strip().casefold()
+
+            if (
+                field_name in ("information", "request information")
+                and (field.value or "").strip()
+            ):
+                return True
+
+    return False
+
+
 async def _tally_reviews(
     channel: discord.TextChannel,
     bot_id: int,
@@ -150,28 +194,31 @@ async def _tally_reviews(
     total = 0
     start_ts = int(month_start.timestamp())
 
-    # Stream messages individually instead of building a list in memory.
+    # Discord history is streamed in pages of up to 100 messages.
+    # No complete history list is held in memory.
+    after_id = _history_after(month_start - lookback)
+
     async for message in channel.history(
         limit=None,
-        after=month_start - lookback,
+        after=after_id,
         oldest_first=False,
     ):
-        # Only process messages authored by this bot.
+        # Only inspect messages authored by this bot.
         if message.author.id != bot_id or not message.embeds:
             continue
 
-        # Identify whether this is a creation or booster request.
-        has_information = _has_creation_information(message)
+        # Build the embed text once and reuse it for classification and matching.
+        text = _embed_text(message.embeds)
+
+        if not text:
+            continue
+
+        has_information = _has_creation_information_fast(message, text)
 
         if creation_only and not has_information:
             continue
 
         if not creation_only and has_information:
-            continue
-
-        text = _message_text(message)
-
-        if "by <@" not in text:
             continue
 
         match = _REVIEW_RE.search(text)
@@ -196,6 +243,40 @@ async def _tally_reviews(
     return counts, total
 
 
+def _get_derank_source(embeds: list[dict[str, Any]]) -> str | None:
+    """Get the first embed containing the derank marker.
+
+    Retained from the previous implementation. The message-search API is
+    not used by this version.
+    """
+    for embed in embeds:
+        parts = [
+            embed.get("title") or "",
+            embed.get("description") or "",
+        ]
+
+        for field in embed.get("fields", []):
+            parts.extend([
+                field.get("name") or "",
+                field.get("value") or "",
+            ])
+
+        author = embed.get("author") or {}
+        if author:
+            parts.append(author.get("name") or "")
+
+        footer = embed.get("footer") or {}
+        if footer:
+            parts.append(footer.get("text") or "")
+
+        embed_text = "\n".join(parts)
+
+        if _DERANK_RE.search(embed_text):
+            return embed_text
+
+    return None
+
+
 async def _tally_deranks(
     channel: discord.TextChannel | discord.Thread,
     bot_id: int,
@@ -204,15 +285,11 @@ async def _tally_deranks(
 ) -> tuple[Counts, int]:
     """Count deranks from the bot's own embeds using normal channel history.
 
-    This does NOT use Discord's message-search endpoint and does NOT require
-    the Message Content privileged intent.
+    Does not use Discord's message-search endpoint and does not require
+    Message Content privileged intent.
 
     Messages are streamed one at a time. Other authors are skipped immediately.
     Only embeds from messages authored by this bot are inspected.
-
-    Discord still returns message objects from the channel history endpoint,
-    including metadata for other authors. Their content and embeds are not
-    inspected by this function.
     """
     counts: Counts = {}
     total = 0
@@ -231,17 +308,15 @@ async def _tally_deranks(
         logger.error("Derank scan refused: channel has no guild.")
         return counts, total
 
-    # Stream only this month's history. No message list is created.
+    after_id = _history_after(month_start)
+
     async for message in channel.history(
         limit=None,
-        after=month_start,
+        after=after_id,
         oldest_first=False,
     ):
-        # Ignore other authors before inspecting any embed data.
-        if message.author.id != bot_id:
-            continue
-
-        if not message.embeds:
+        # Ignore other authors before inspecting their embeds.
+        if message.author.id != bot_id or not message.embeds:
             continue
 
         # Only inspect embeds, never message content.
@@ -250,22 +325,19 @@ async def _tally_deranks(
         if not content:
             continue
 
-        # Capture the exact staff mention after "Deranked by".
         match = _DERANK_RE.search(content)
 
         if match is None:
             continue
 
+        # Exact staff mention immediately after "Deranked by".
         staff_id = int(match.group(1))
 
         # Only count target mentions before the staff marker.
         target_text = content[:match.start()]
 
         # Deduplicate targets within this individual derank log.
-        deranked_members = set(
-            _MENTION_RE.findall(target_text)
-        )
-
+        deranked_members = set(_MENTION_RE.findall(target_text))
         entries = len(deranked_members)
 
         if entries == 0:
@@ -465,10 +537,7 @@ def build_leaderboard_command(
 
         async with lock:
             try:
-                empty: tuple[Counts, int] = ({}, 0)
-
-                # Run scans sequentially to reduce peak memory and concurrent
-                # network activity on the Render free tier.
+                # Sequential scans keep peak memory and concurrent network activity low.
                 if creation_channel is not None:
                     creation_counts, creation_total = await _tally_reviews(
                         creation_channel,
@@ -479,7 +548,7 @@ def build_leaderboard_command(
                         creation_only=True,
                     )
                 else:
-                    creation_counts, creation_total = empty
+                    creation_counts, creation_total = _COUNTS_EMPTY
 
                 if booster_channel is not None:
                     booster_counts, booster_total = await _tally_reviews(
@@ -491,7 +560,7 @@ def build_leaderboard_command(
                         creation_only=False,
                     )
                 else:
-                    booster_counts, booster_total = empty
+                    booster_counts, booster_total = _COUNTS_EMPTY
 
                 if roleshift_channel is not None:
                     derank_counts, derank_total = await _tally_deranks(
@@ -500,7 +569,7 @@ def build_leaderboard_command(
                         month_start=month_start,
                     )
                 else:
-                    derank_counts, derank_total = empty
+                    derank_counts, derank_total = _COUNTS_EMPTY
 
             except discord.Forbidden:
                 await reply(
