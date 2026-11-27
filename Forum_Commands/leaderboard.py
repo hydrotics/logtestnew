@@ -155,7 +155,6 @@ async def _tally_reviews(
     total = 0
     start_ts = int(month_start.timestamp())
 
-    # Only retrieve messages from the beginning of this month onwards.
     after_id = _history_after(month_start)
 
     async for message in channel.history(
@@ -163,15 +162,13 @@ async def _tally_reviews(
         after=after_id,
         oldest_first=True,
     ):
-        # Immediately discard messages that aren't authored by this bot.
+        # Immediately discard messages not authored by this bot.
         if message.author.id != bot_id:
             continue
 
-        # Ignore bot messages without embeds.
         if not message.embeds:
             continue
 
-        # Classify creation requests separately from booster requests.
         has_information = _has_creation_information(message)
 
         if creation_only and not has_information:
@@ -190,11 +187,9 @@ async def _tally_reviews(
         if match is None:
             continue
 
-        # Booster requests only count when Accepted.
         if accepted_only and match.group(1) != "Accepted":
             continue
 
-        # Use the review timestamp written in the embed.
         if int(match.group(3)) < start_ts:
             continue
 
@@ -227,7 +222,6 @@ async def _tally_deranks(
         logger.error("Derank scan refused: channel has no guild.")
         return counts, total
 
-    # Only retrieve messages from the beginning of this month onwards.
     after_id = _history_after(month_start)
 
     async for message in channel.history(
@@ -235,7 +229,7 @@ async def _tally_deranks(
         after=after_id,
         oldest_first=True,
     ):
-        # Immediately discard messages that aren't authored by this bot.
+        # Immediately discard messages not authored by this bot.
         if message.author.id != bot_id:
             continue
 
@@ -252,7 +246,6 @@ async def _tally_deranks(
         if match is None:
             continue
 
-        # Exact staff mention immediately following "Deranked by".
         staff_id = int(match.group(1))
 
         # Only count target mentions before the staff marker.
@@ -269,6 +262,11 @@ async def _tally_deranks(
         total += entries
 
     return counts, total
+
+
+async def _empty_counts() -> tuple[Counts, int]:
+    """Return empty results when a channel is not configured."""
+    return {}, 0
 
 
 def _top(counts: Counts) -> list[tuple[int, int]]:
@@ -458,42 +456,45 @@ def build_leaderboard_command(
         )
 
         bot_id = interaction.client.user.id if interaction.client.user else 0
-
         month_start, next_month = _month_bounds()
 
         async with lock:
             try:
-                # Sequential scans keep peak memory and concurrent network activity low.
-                if creation_channel is not None:
-                    creation_counts, creation_total = await _tally_reviews(
+                # Run all independent channel scans at the same time.
+                # Each scan streams messages and keeps only its small tally in memory.
+                (
+                    (creation_counts, creation_total),
+                    (booster_counts, booster_total),
+                    (derank_counts, derank_total),
+                ) = await asyncio.gather(
+                    _tally_reviews(
                         creation_channel,
                         bot_id,
                         month_start=month_start,
                         accepted_only=False,
                         creation_only=True,
                     )
-                else:
-                    creation_counts, creation_total = _COUNTS_EMPTY
+                    if creation_channel is not None
+                    else _empty_counts(),
 
-                if booster_channel is not None:
-                    booster_counts, booster_total = await _tally_reviews(
+                    _tally_reviews(
                         booster_channel,
                         bot_id,
                         month_start=month_start,
                         accepted_only=True,
                         creation_only=False,
                     )
-                else:
-                    booster_counts, booster_total = _COUNTS_EMPTY
+                    if booster_channel is not None
+                    else _empty_counts(),
 
-                if roleshift_channel is not None:
-                    derank_counts, derank_total = await _tally_deranks(
+                    _tally_deranks(
                         roleshift_channel,
                         bot_id,
                         month_start=month_start,
                     )
-                else:
-                    derank_counts, derank_total = _COUNTS_EMPTY
+                    if roleshift_channel is not None
+                    else _empty_counts(),
+                )
 
             except discord.Forbidden:
                 await reply(
