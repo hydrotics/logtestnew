@@ -33,6 +33,7 @@ create_log_module.build_status_embed = _build_status_embed_with_global_colour
 from Forum_Commands.create_log_command import build_create_log_commands
 from Forum_Commands.creation_prompt_command import setup_creation_prompt
 from Forum_Commands.echo_command import build_echo_commands
+from Forum_Commands.leaderboard import build_leaderboard_command
 from Forum_Commands.status_command import build_status_command
 from settings import CONFIG, DEFAULT_SETTINGS, build_settings_command
 from group_scan import (
@@ -238,6 +239,10 @@ class LogBot(discord.Client):
             manager=log_manager,
             owner_id=BOT_OWNER_ID,
         )
+        leaderboard_command = build_leaderboard_command(
+            manager=log_manager,
+            owner_id=BOT_OWNER_ID,
+        )
         settings_command = build_settings_command(
             owner_id=BOT_OWNER_ID,
             manager=log_manager,
@@ -255,6 +260,7 @@ class LogBot(discord.Client):
             fetch_rank_command,
             booster_user_prompt_command,
             creation_prompt_command,
+            leaderboard_command,
             settings_command,
             *echo_commands,
         )
