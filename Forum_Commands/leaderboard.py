@@ -17,6 +17,9 @@ logger = logging.getLogger("discord-log-bot.leaderboard")
 
 TOP_N = 5
 
+# Fixed channel containing the booster derank logs.
+DERANK_CHANNEL_ID = 1272268411145289831
+
 # A message is created BEFORE it is reviewed, so we look slightly further back than the
 # start of the month to catch submissions that were reviewed early this month.
 # Creation submissions are re-sent every 24h while pending, so a short buffer is enough.
@@ -36,10 +39,13 @@ _INFORMATION_RE = re.compile(
     r"(?im)^\s*(?:\*\*)?(?:request\s+)?information(?:\*\*)?\s*:"
 )
 
-# Roleshift log messages end with "... · Deranked by <@staff>" and list one or more
-# deranked members as mentions before it.
-_DERANK_RE = re.compile(r"Deranked by <@!?(\d+)>")
-_MENTION_RE = re.compile(r"<@!?\d+>")
+# Matches the exact staff mention immediately following "Deranked by".
+_DERANK_RE = re.compile(
+    r"\bDeranked by\s*<@!?(\d+)>"
+)
+
+# Matches normal Discord user mentions, excluding roles and channels.
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
 Counts = dict[int, int]
 
@@ -47,10 +53,12 @@ Counts = dict[int, int]
 def _month_bounds() -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
     if start.month == 12:
         end = start.replace(year=start.year + 1, month=1)
     else:
         end = start.replace(month=start.month + 1)
+
     return start, end
 
 
@@ -77,34 +85,6 @@ def _message_text(message: discord.Message) -> str:
     return "\n".join(parts)
 
 
-def _derank_message_text(message: discord.Message) -> str:
-    """Collect derank text in display order so member mentions precede the staff marker."""
-    parts = [message.content or ""]
-
-    for embed in message.embeds:
-        parts.extend([
-            embed.title or "",
-            embed.description or "",
-        ])
-
-        # Embed fields are displayed before the footer.
-        for field in embed.fields:
-            parts.extend([
-                field.name or "",
-                field.value or "",
-            ])
-
-        author = getattr(embed, "author", None)
-        if author:
-            parts.append(author.name or "")
-
-        footer = getattr(embed, "footer", None)
-        if footer:
-            parts.append(footer.text or "")
-
-    return "\n".join(parts)
-
-
 def _has_creation_information(message: discord.Message) -> bool:
     """Identify creation requests by their information text in the embed."""
     for embed in message.embeds:
@@ -127,6 +107,7 @@ def _has_creation_information(message: discord.Message) -> bool:
                 return True
 
         description = embed.description or ""
+
         if description and _INFORMATION_RE.search(description):
             return True
 
@@ -174,6 +155,7 @@ async def _tally_reviews(
             continue
 
         match = _REVIEW_RE.search(text)
+
         if match is None:
             continue
 
@@ -194,49 +176,116 @@ async def _tally_reviews(
     return counts, total
 
 
+def _get_derank_source(message: discord.Message) -> str | None:
+    """Get exactly one source containing the derank marker.
+
+    Prefer message content if it contains the marker.
+    Otherwise, use the first embed containing the marker.
+
+    Never combine message content with embed text, preventing duplicate
+    mentions from the same log message from being counted twice.
+    """
+    content = message.content or ""
+
+    if _DERANK_RE.search(content):
+        return content
+
+    for embed in message.embeds:
+        parts = [
+            embed.title or "",
+            embed.description or "",
+        ]
+
+        for field in embed.fields:
+            parts.extend([
+                field.name or "",
+                field.value or "",
+            ])
+
+        author = getattr(embed, "author", None)
+
+        if author:
+            parts.append(author.name or "")
+
+        footer = getattr(embed, "footer", None)
+
+        if footer:
+            parts.append(footer.text or "")
+
+        embed_text = "\n".join(parts)
+
+        if _DERANK_RE.search(embed_text):
+            return embed_text
+
+    return None
+
+
 async def _tally_deranks(
     channel: discord.abc.Messageable,
     bot_id: int,
     *,
     month_start: datetime,
 ) -> tuple[Counts, int]:
-    """Count deranked members attributed to the staff member in each roleshift log.
+    """Count deranked members from the dedicated booster derank channel.
 
-    Only member mentions BEFORE 'Deranked by <@staff>' are counted.
-    The staff member mentioned after 'Deranked by' receives credit for those deranks.
-    The total is the number of actual deranked members, not the number of log messages.
+    Only the exact staff mention immediately following 'Deranked by'
+    receives credit.
+
+    Only unique target member mentions before that marker are counted.
+    Each Discord message is processed once and only one source is examined.
     """
     counts: Counts = {}
     total = 0
+
+    # Prevent accidental processing of any other channel.
+    if getattr(channel, "id", None) != DERANK_CHANNEL_ID:
+        logger.error(
+            "Derank scan refused: expected channel %s, received channel %s",
+            DERANK_CHANNEL_ID,
+            getattr(channel, "id", None),
+        )
+        return counts, total
 
     async for message in channel.history(
         limit=None,
         after=month_start,
         oldest_first=False,
     ):
+        # Only process messages sent by our bot.
         if message.author.id != bot_id:
             continue
 
-        content = _derank_message_text(message)
+        # Get one authoritative source, not combined message/embed text.
+        content = _get_derank_source(message)
 
-        if not content or "Deranked by" not in content:
+        if content is None:
             continue
 
+        # Find the exact staff mention immediately after "Deranked by".
         match = _DERANK_RE.search(content)
+
         if match is None:
             continue
 
-        # Only count mentions appearing BEFORE the "Deranked by" staff marker.
-        # This prevents unrelated mentions elsewhere in the message from being counted.
-        deranked_members = _MENTION_RE.findall(content[:match.start()])
+        # The staff ID is captured directly from the mention after Deranked by.
+        staff_id = int(match.group(1))
+
+        # Only count target mentions appearing BEFORE the staff marker.
+        target_text = content[:match.start()]
+
+        # Extract unique member IDs.
+        # This prevents repeated mentions of the same member in one log
+        # from inflating the derank total.
+        deranked_members = list(dict.fromkeys(
+            _MENTION_RE.findall(target_text)
+        ))
 
         entries = len(deranked_members)
 
-        # Do not invent a derank count when no target members were found.
+        # Ignore malformed logs without any target members.
         if entries == 0:
             continue
 
-        staff_id = int(match.group(1))
         counts[staff_id] = counts.get(staff_id, 0) + entries
         total += entries
 
@@ -351,14 +400,24 @@ def build_leaderboard_command(
         channel_id: int,
     ) -> discord.TextChannel | None:
         channel = guild.get_channel(channel_id) if channel_id else None
-        return channel if isinstance(channel, discord.TextChannel) else None
+
+        return (
+            channel
+            if isinstance(channel, discord.TextChannel)
+            else None
+        )
 
     def log_channel(
         guild: discord.Guild,
         channel_id: int,
     ) -> discord.TextChannel | discord.Thread | None:
         channel = guild.get_channel_or_thread(channel_id) if channel_id else None
-        return channel if isinstance(channel, (discord.TextChannel, discord.Thread)) else None
+
+        return (
+            channel
+            if isinstance(channel, (discord.TextChannel, discord.Thread))
+            else None
+        )
 
     @app_commands.command(
         name="leaderboard",
@@ -369,7 +428,10 @@ def build_leaderboard_command(
         guild = interaction.guild
 
         if guild is None:
-            await reply(interaction, "Run this command inside the server.")
+            await reply(
+                interaction,
+                "Run this command inside the server.",
+            )
             return
 
         creation_channel = text_channel(
@@ -382,9 +444,10 @@ def build_leaderboard_command(
             int(group_scan.BOOSTER_RANK or 0),
         )
 
+        # Deranks ALWAYS use the specified channel ID.
         roleshift_channel = log_channel(
             guild,
-            int(group_scan.ROLESHIFT_CHANNEL or 0),
+            DERANK_CHANNEL_ID,
         )
 
         if (
@@ -406,9 +469,13 @@ def build_leaderboard_command(
             )
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
 
         bot_id = interaction.client.user.id if interaction.client.user else 0
+
         month_start, next_month = _month_bounds()
 
         async with lock:
@@ -473,6 +540,7 @@ def build_leaderboard_command(
                 logger.exception(
                     "Could not read channel history for the leaderboard"
                 )
+
                 await reply(
                     interaction,
                     "Discord didn't let me read the channels. Try again shortly.",
