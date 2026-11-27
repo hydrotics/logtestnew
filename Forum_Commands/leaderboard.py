@@ -1,11 +1,10 @@
-
 from __future__ import annotations
 
 import asyncio
 import heapq
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import discord
@@ -17,35 +16,40 @@ logger = logging.getLogger("discord-log-bot.leaderboard")
 
 TOP_N = 5
 
-# Fixed channel containing the booster derank logs.
 DERANK_CHANNEL_ID = 1272268411145289831
 
-# Matches the status line the bot writes when a request is reviewed.
+# Scan seven days at a time.
+SCAN_WINDOW_DAYS = 7
+
+# Limit concurrent requests per channel to avoid flooding Discord.
+MAX_PARALLEL_WINDOWS = 5
+
 _REVIEW_RE = re.compile(
     r"\*\*Status:\*\*\s*(Accepted|Denied) by <@!?(\d+)>\s*[·\u00b7]\s*<t:(\d+)"
 )
 
-# Matches the information label in creation request embeds.
 _INFORMATION_RE = re.compile(
     r"(?im)^\s*(?:\*\*)?(?:request\s+)?information(?:\*\*)?\s*:"
 )
 
-# Matches the exact staff mention immediately following "Deranked by".
 _DERANK_RE = re.compile(
     r"\bDeranked by\s*<@!?(\d+)>"
 )
 
-# Matches normal Discord user mentions, excluding roles and channels.
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
-
-_COUNTS_EMPTY: tuple[dict[int, int], int] = ({}, 0)
 
 Counts = dict[int, int]
 
 
 def _month_bounds() -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
-    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start = now.replace(
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
 
     if start.month == 12:
         end = start.replace(year=start.year + 1, month=1)
@@ -56,14 +60,37 @@ def _month_bounds() -> tuple[datetime, datetime]:
 
 
 def _history_after(timestamp: datetime) -> discord.Object:
-    """Create a snowflake marking the beginning of the requested period."""
     return discord.Object(
         id=discord.utils.time_snowflake(timestamp)
     )
 
 
+def _history_before(timestamp: datetime) -> discord.Object:
+    return discord.Object(
+        id=discord.utils.time_snowflake(timestamp)
+    )
+
+
+def _make_windows(
+    start: datetime,
+    end: datetime,
+) -> list[tuple[datetime, datetime]]:
+    windows = []
+    current = start
+
+    while current < end:
+        window_end = min(
+            current + timedelta(days=SCAN_WINDOW_DAYS),
+            end,
+        )
+
+        windows.append((current, window_end))
+        current = window_end
+
+    return windows
+
+
 def _embed_text(embeds: list[discord.Embed]) -> str:
-    """Collect searchable text from embeds only."""
     parts: list[str] = []
 
     for embed in embeds:
@@ -84,7 +111,6 @@ def _embed_text(embeds: list[discord.Embed]) -> str:
 
 
 def _has_creation_information(message: discord.Message) -> bool:
-    """Identify creation requests using their information fields."""
     for embed in message.embeds:
         for field in embed.fields:
             field_name = re.sub(
@@ -113,7 +139,6 @@ def _has_creation_information(message: discord.Message) -> bool:
 
 
 def _get_derank_source(embeds: list[dict[str, Any]]) -> str | None:
-    """Get the first embed containing the derank marker."""
     for embed in embeds:
         parts = [
             embed.get("title") or "",
@@ -142,27 +167,26 @@ def _get_derank_source(embeds: list[dict[str, Any]]) -> str | None:
     return None
 
 
-async def _tally_reviews(
+async def _tally_reviews_window(
     channel: discord.TextChannel,
     bot_id: int,
     *,
-    month_start: datetime,
+    window_start: datetime,
+    window_end: datetime,
     accepted_only: bool,
     creation_only: bool,
 ) -> tuple[Counts, int]:
-    """Count this month's creation reviews or booster approvals."""
     counts: Counts = {}
     total = 0
-    start_ts = int(month_start.timestamp())
 
-    after_id = _history_after(month_start)
+    start_ts = int(window_start.timestamp())
 
     async for message in channel.history(
         limit=None,
-        after=after_id,
+        after=_history_after(window_start),
+        before=_history_before(window_end),
         oldest_first=True,
     ):
-        # Immediately discard messages not authored by this bot.
         if message.author.id != bot_id:
             continue
 
@@ -200,36 +224,67 @@ async def _tally_reviews(
     return counts, total
 
 
-async def _tally_deranks(
-    channel: discord.TextChannel | discord.Thread,
+async def _tally_reviews(
+    channel: discord.TextChannel,
     bot_id: int,
     *,
     month_start: datetime,
+    month_end: datetime,
+    accepted_only: bool,
+    creation_only: bool,
 ) -> tuple[Counts, int]:
-    """Count this month's deranks from the bot's own embeds."""
+    windows = _make_windows(month_start, month_end)
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_WINDOWS)
+
+    async def scan_window(
+        window_start: datetime,
+        window_end: datetime,
+    ) -> tuple[Counts, int]:
+        async with semaphore:
+            return await _tally_reviews_window(
+                channel,
+                bot_id,
+                window_start=window_start,
+                window_end=window_end,
+                accepted_only=accepted_only,
+                creation_only=creation_only,
+            )
+
+    results = await asyncio.gather(
+        *(
+            scan_window(window_start, window_end)
+            for window_start, window_end in windows
+        )
+    )
+
+    combined: Counts = {}
+    total = 0
+
+    for counts, window_total in results:
+        for staff_id, count in counts.items():
+            combined[staff_id] = combined.get(staff_id, 0) + count
+
+        total += window_total
+
+    return combined, total
+
+
+async def _tally_deranks_window(
+    channel: discord.TextChannel | discord.Thread,
+    bot_id: int,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[Counts, int]:
     counts: Counts = {}
     total = 0
 
-    if getattr(channel, "id", None) != DERANK_CHANNEL_ID:
-        logger.error(
-            "Derank scan refused: expected channel %s, received channel %s",
-            DERANK_CHANNEL_ID,
-            getattr(channel, "id", None),
-        )
-        return counts, total
-
-    if getattr(channel, "guild", None) is None:
-        logger.error("Derank scan refused: channel has no guild.")
-        return counts, total
-
-    after_id = _history_after(month_start)
-
     async for message in channel.history(
         limit=None,
-        after=after_id,
+        after=_history_after(window_start),
+        before=_history_before(window_end),
         oldest_first=True,
     ):
-        # Immediately discard messages not authored by this bot.
         if message.author.id != bot_id:
             continue
 
@@ -247,11 +302,8 @@ async def _tally_deranks(
             continue
 
         staff_id = int(match.group(1))
-
-        # Only count target mentions before the staff marker.
         target_text = content[:match.start()]
 
-        # Deduplicate targets within this individual derank log.
         deranked_members = set(_MENTION_RE.findall(target_text))
         entries = len(deranked_members)
 
@@ -264,9 +316,57 @@ async def _tally_deranks(
     return counts, total
 
 
-async def _empty_counts() -> tuple[Counts, int]:
-    """Return empty results when a channel is not configured."""
-    return {}, 0
+async def _tally_deranks(
+    channel: discord.TextChannel | discord.Thread,
+    bot_id: int,
+    *,
+    month_start: datetime,
+    month_end: datetime,
+) -> tuple[Counts, int]:
+    counts: Counts = {}
+    total = 0
+
+    if getattr(channel, "id", None) != DERANK_CHANNEL_ID:
+        logger.error(
+            "Derank scan refused: expected channel %s, received channel %s",
+            DERANK_CHANNEL_ID,
+            getattr(channel, "id", None),
+        )
+        return counts, total
+
+    if getattr(channel, "guild", None) is None:
+        logger.error("Derank scan refused: channel has no guild.")
+        return counts, total
+
+    windows = _make_windows(month_start, month_end)
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_WINDOWS)
+
+    async def scan_window(
+        window_start: datetime,
+        window_end: datetime,
+    ) -> tuple[Counts, int]:
+        async with semaphore:
+            return await _tally_deranks_window(
+                channel,
+                bot_id,
+                window_start=window_start,
+                window_end=window_end,
+            )
+
+    results = await asyncio.gather(
+        *(
+            scan_window(window_start, window_end)
+            for window_start, window_end in windows
+        )
+    )
+
+    for window_counts, window_total in results:
+        for staff_id, count in window_counts.items():
+            counts[staff_id] = counts.get(staff_id, 0) + count
+
+        total += window_total
+
+    return counts, total
 
 
 def _top(counts: Counts) -> list[tuple[int, int]]:
@@ -282,7 +382,6 @@ def _board_text(
     rows: list[tuple[int, int]],
     total: int,
 ) -> str:
-    """Build a normal message leaderboard for one category."""
     header = f"## {title}"
 
     if not rows:
@@ -301,7 +400,6 @@ def _board_text(
 
 
 class LeaderboardView(discord.ui.View):
-    """Interactive three-category leaderboard with a next-category button."""
 
     def __init__(
         self,
@@ -320,7 +418,6 @@ class LeaderboardView(discord.ui.View):
         self.page = 0
 
     def render_content(self) -> str:
-        """Render the currently selected category."""
         title, rows, total = self.boards[self.page]
 
         month_info = (
@@ -346,7 +443,6 @@ class LeaderboardView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        """Move to the next category and update the existing message."""
         self.page = (self.page + 1) % len(self.boards)
 
         await interaction.response.edit_message(
@@ -361,6 +457,7 @@ def build_leaderboard_command(
     manager: Any,
     owner_id: int,
 ) -> app_commands.Command:
+
     lock = asyncio.Lock()
 
     async def reply(
@@ -368,9 +465,15 @@ def build_leaderboard_command(
         message: str,
     ) -> None:
         if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
+            await interaction.followup.send(
+                message,
+                ephemeral=True,
+            )
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+            )
 
     def text_channel(
         guild: discord.Guild,
@@ -425,7 +528,6 @@ def build_leaderboard_command(
             int(group_scan.BOOSTER_RANK or 0),
         )
 
-        # Deranks ALWAYS use the specified channel ID.
         roleshift_channel = log_channel(
             guild,
             DERANK_CHANNEL_ID,
@@ -460,8 +562,6 @@ def build_leaderboard_command(
 
         async with lock:
             try:
-                # Run all independent channel scans at the same time.
-                # Each scan streams messages and keeps only its small tally in memory.
                 (
                     (creation_counts, creation_total),
                     (booster_counts, booster_total),
@@ -471,29 +571,32 @@ def build_leaderboard_command(
                         creation_channel,
                         bot_id,
                         month_start=month_start,
+                        month_end=next_month,
                         accepted_only=False,
                         creation_only=True,
                     )
                     if creation_channel is not None
-                    else _empty_counts(),
+                    else asyncio.sleep(0, result=({}, 0)),
 
                     _tally_reviews(
                         booster_channel,
                         bot_id,
                         month_start=month_start,
+                        month_end=next_month,
                         accepted_only=True,
                         creation_only=False,
                     )
                     if booster_channel is not None
-                    else _empty_counts(),
+                    else asyncio.sleep(0, result=({}, 0)),
 
                     _tally_deranks(
                         roleshift_channel,
                         bot_id,
                         month_start=month_start,
+                        month_end=next_month,
                     )
                     if roleshift_channel is not None
-                    else _empty_counts(),
+                    else asyncio.sleep(0, result=({}, 0)),
                 )
 
             except discord.Forbidden:
@@ -516,14 +619,10 @@ def build_leaderboard_command(
                 )
                 return
 
-        creation_rows = _top(creation_counts)
-        booster_rows = _top(booster_counts)
-        derank_rows = _top(derank_counts)
-
         boards = (
-            ("Creation Reviews", creation_rows, creation_total),
-            ("Booster Rank Requests", booster_rows, booster_total),
-            ("Booster Deranks", derank_rows, derank_total),
+            ("Creation Reviews", _top(creation_counts), creation_total),
+            ("Booster Rank Requests", _top(booster_counts), booster_total),
+            ("Booster Deranks", _top(derank_counts), derank_total),
         )
 
         view = LeaderboardView(
