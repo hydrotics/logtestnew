@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +9,6 @@ from typing import Any
 
 import discord
 from discord import app_commands
-from discord.http import Route
 
 import group_scan
 
@@ -20,10 +18,6 @@ TOP_N = 5
 
 # Fixed channel containing the booster derank logs.
 DERANK_CHANNEL_ID = 1272268411145289831
-
-# Retained from the previous implementation.
-# Discord message search is not used because it requires Message Content intent.
-DERANK_SEARCH_PAGE_SIZE = 25
 
 # A message is created BEFORE it is reviewed, so we look slightly further back than the
 # start of the month to catch submissions that were reviewed early this month.
@@ -74,29 +68,8 @@ def _history_after(timestamp: datetime) -> discord.Object:
     )
 
 
-def _message_text(message: discord.Message) -> str:
-    """Collect searchable text from the message and all its embeds."""
-    parts = [message.content or ""]
-
-    for embed in message.embeds:
-        parts.extend([
-            embed.title or "",
-            embed.description or "",
-            embed.author.name if embed.author else "",
-            embed.footer.text if embed.footer else "",
-        ])
-
-        for field in embed.fields:
-            parts.extend([
-                field.name or "",
-                field.value or "",
-            ])
-
-    return "\n".join(parts)
-
-
 def _embed_text(embeds: list[discord.Embed]) -> str:
-    """Collect text from embeds only, without inspecting message content."""
+    """Collect searchable text from embeds only."""
     parts: list[str] = []
 
     for embed in embeds:
@@ -117,7 +90,7 @@ def _embed_text(embeds: list[discord.Embed]) -> str:
 
 
 def _has_creation_information(message: discord.Message) -> bool:
-    """Identify creation requests by their information text in the embed."""
+    """Identify creation requests using the original information-field checks."""
     for embed in message.embeds:
         for field in embed.fields:
             field_name = re.sub(
@@ -145,37 +118,6 @@ def _has_creation_information(message: discord.Message) -> bool:
     return False
 
 
-def _has_creation_information_fast(
-    message: discord.Message,
-    text: str,
-) -> bool:
-    """Classify a review using already-collected embed text."""
-    if _INFORMATION_RE.search(text):
-        return True
-
-    for embed in message.embeds:
-        for field in embed.fields:
-            name = field.name or ""
-
-            # Avoid regex substitution for ordinary field names.
-            if not any(char in name for char in "*_`~"):
-                field_name = name.strip().casefold()
-            else:
-                field_name = re.sub(
-                    r"[*_`~]",
-                    "",
-                    name,
-                ).strip().casefold()
-
-            if (
-                field_name in ("information", "request information")
-                and (field.value or "").strip()
-            ):
-                return True
-
-    return False
-
-
 async def _tally_reviews(
     channel: discord.TextChannel,
     bot_id: int,
@@ -194,31 +136,33 @@ async def _tally_reviews(
     total = 0
     start_ts = int(month_start.timestamp())
 
-    # Discord history is streamed in pages of up to 100 messages.
-    # No complete history list is held in memory.
+    # Start at the requested date and paginate FORWARD.
+    # oldest_first=True is important: with after=..., setting it to False
+    # makes discord.py start at the newest messages and work backwards.
     after_id = _history_after(month_start - lookback)
 
     async for message in channel.history(
         limit=None,
         after=after_id,
-        oldest_first=False,
+        oldest_first=True,
     ):
         # Only inspect messages authored by this bot.
         if message.author.id != bot_id or not message.embeds:
             continue
 
-        # Build the embed text once and reuse it for classification and matching.
-        text = _embed_text(message.embeds)
-
-        if not text:
-            continue
-
-        has_information = _has_creation_information_fast(message, text)
+        # Preserve the original creation-versus-booster classification.
+        has_information = _has_creation_information(message)
 
         if creation_only and not has_information:
             continue
 
         if not creation_only and has_information:
+            continue
+
+        # Only inspect the bot's embeds.
+        text = _embed_text(message.embeds)
+
+        if not text:
             continue
 
         match = _REVIEW_RE.search(text)
@@ -241,40 +185,6 @@ async def _tally_reviews(
         total += 1
 
     return counts, total
-
-
-def _get_derank_source(embeds: list[dict[str, Any]]) -> str | None:
-    """Get the first embed containing the derank marker.
-
-    Retained from the previous implementation. The message-search API is
-    not used by this version.
-    """
-    for embed in embeds:
-        parts = [
-            embed.get("title") or "",
-            embed.get("description") or "",
-        ]
-
-        for field in embed.get("fields", []):
-            parts.extend([
-                field.get("name") or "",
-                field.get("value") or "",
-            ])
-
-        author = embed.get("author") or {}
-        if author:
-            parts.append(author.get("name") or "")
-
-        footer = embed.get("footer") or {}
-        if footer:
-            parts.append(footer.get("text") or "")
-
-        embed_text = "\n".join(parts)
-
-        if _DERANK_RE.search(embed_text):
-            return embed_text
-
-    return None
 
 
 async def _tally_deranks(
@@ -308,12 +218,13 @@ async def _tally_deranks(
         logger.error("Derank scan refused: channel has no guild.")
         return counts, total
 
+    # Start at the beginning of this month and paginate FORWARD.
     after_id = _history_after(month_start)
 
     async for message in channel.history(
         limit=None,
         after=after_id,
-        oldest_first=False,
+        oldest_first=True,
     ):
         # Ignore other authors before inspecting their embeds.
         if message.author.id != bot_id or not message.embeds:
@@ -468,7 +379,11 @@ def build_leaderboard_command(
         guild: discord.Guild,
         channel_id: int,
     ) -> discord.TextChannel | discord.Thread | None:
-        channel = guild.get_channel_or_thread(channel_id) if channel_id else None
+        channel = (
+            guild.get_channel_or_thread(channel_id)
+            if channel_id
+            else None
+        )
 
         return (
             channel
